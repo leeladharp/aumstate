@@ -1,36 +1,721 @@
 import streamlit as st
 import ollama
-from typing import TypedDict, List, Dict
+import json
+import re
+import pandas as pd
+from pypdf import PdfReader
+from typing import TypedDict, List, Dict, Callable
 from langgraph.graph import StateGraph, START, END
-
+import sqlite3
+from datetime import datetime
+from ddgs import DDGS
 
 class AumState(TypedDict):
     question: str
     route: str
+    route_reason: str
+    route_confidence: float
     answer: str
     messages: List[Dict[str, str]]
+    tool_result: str
+    csv_summary: str
+    pdf_text: str
+    pdf_intelligence: str
+    pdf_chunks: List[Dict[str, str]]
+    web_sources: List[Dict[str, str]]
+
+# -----------------------------
+# Persistent Memory: SQLite
+# Comes from: Python sqlite3
+# Role: save/load chat history beyond Streamlit session
+# -----------------------------
+DB_PATH = "aumstate_memory.db"
 
 
+def init_memory_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS chat_memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_facts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fact_key TEXT NOT NULL,
+            fact_value TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    conn.commit()
+    conn.close()
+
+
+def save_message_to_db(role: str, content: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        INSERT INTO chat_memory (role, content, created_at)
+        VALUES (?, ?, ?)
+        """,
+        (role, content, datetime.now().isoformat())
+    )
+
+    conn.commit()
+    conn.close()
+
+def save_user_fact(fact_key: str, fact_value: str):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        INSERT INTO user_facts (fact_key, fact_value, created_at)
+        VALUES (?, ?, ?)
+        """,
+        (fact_key, fact_value, datetime.now().isoformat())
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def load_user_facts(limit: int = 50) -> str:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT fact_key, fact_value
+        FROM user_facts
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,)
+    )
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        return "No saved user facts yet."
+
+    rows = rows[::-1]
+
+    facts = []
+    for key, value in rows:
+        facts.append(f"- {key}: {value}")
+
+    return "\n".join(facts)
+
+def extract_and_save_user_facts(user_text: str):
+    text = user_text.strip()
+    lower = text.lower()
+
+    # Save name
+    name_patterns = [
+        r"my name is ([a-zA-Z]+)",
+        r"i am ([a-zA-Z]+)",
+        r"i'm ([a-zA-Z]+)"
+    ]
+
+    for pattern in name_patterns:
+        match = re.search(pattern, lower)
+        if match:
+            name = match.group(1).capitalize()
+            save_user_fact("name", name)
+
+    # Save project
+    if "aum state" in lower or "aumstate" in lower:
+        save_user_fact("project", "User is building AUM State.")
+
+    # Save preference
+    if "practical" in lower and "code" in lower:
+        save_user_fact("preference", "User prefers practical code-focused explanations.")
+        
+
+def clear_user_facts():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("DELETE FROM user_facts")
+
+    conn.commit()
+    conn.close()
+
+def load_messages_from_db(limit: int = 30):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        SELECT role, content
+        FROM chat_memory
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,)
+    )
+
+    rows = cursor.fetchall()
+    conn.close()
+
+    # Reverse because DB query gives newest first
+    rows = rows[::-1]
+
+    return [
+        {"role": role, "content": content}
+        for role, content in rows
+    ]
+
+
+def clear_memory_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("DELETE FROM chat_memory")
+
+    conn.commit()
+    conn.close()
+
+# -----------------------------
+# Memory helper
+# -----------------------------
+def update_memory(state: AumState, answer: str):
+    user_message = {"role": "user", "content": state["question"]}
+    assistant_message = {"role": "assistant", "content": answer}
+
+    # Save chat history
+    save_message_to_db("user", state["question"])
+    save_message_to_db("assistant", answer)
+
+    # Save important facts separately
+    extract_and_save_user_facts(state["question"])
+
+    return state["messages"] + [
+        user_message,
+        assistant_message
+    ]
+
+
+# -----------------------------
+# Router
+# -----------------------------
 def router_node(state: AumState):
-    q = state["question"].lower()
+    router_prompt = """
+You are a routing classifier for AUM State.
 
-    if any(word in q for word in [
-        "gita", "karma", "yoga", "spiritual", "mantra", "meditation", "aum", "om"
-    ]):
-        return {"route": "spiritual"}
+Choose exactly one route:
+- spiritual
+- technical
+- business
+- calculator
+- csv_analyzer
+- pdf_reader
+- web_search
 
-    elif any(word in q for word in [
-        "sql", "spark", "python", "error", "code", "data", "gpu", "nvidia",
-        "ollama", "wsl", "linux", "cuda", "langgraph", "api"
-    ]):
-        return {"route": "technical"}
+Route rules:
+- calculator: calculate, compute, arithmetic, percentage, math expressions
+- csv_analyzer: CSV, uploaded CSV, sales data, analyze data, dataframe, rows, columns, revenue, units
+- pdf_reader: PDF, uploaded PDF, document, summarize document, explain document, policy, report, benefits, contract, chapter, preface, table of contents
+- web_search: latest, current, live web, internet, news, price, search, browse, today, recently, current version, current docs
+- spiritual: Gita, yoga, meditation, mantra, dharma, karma, spirituality, reflection
+- technical: SQL, Spark, Python, code, errors, AI, GPU, NVIDIA, CUDA, WSL, Ollama, LangGraph
+- business: money, career growth, business ideas, investments, productivity, decision-making
 
+Return ONLY valid JSON:
+{
+  "route": "technical",
+  "reason": "The user is asking about a software topic.",
+  "confidence": 0.95
+}
+"""
+
+    response = ollama.chat(
+        model="qwen3:8b",
+        messages=[
+            {"role": "system", "content": router_prompt},
+            {"role": "user", "content": state["question"]}
+        ]
+    )
+
+    raw = response["message"]["content"].strip()
+
+    try:
+        data = json.loads(raw)
+        route = data.get("route", "business").lower()
+        reason = data.get("reason", "No reason provided.")
+        confidence = float(data.get("confidence", 0.5))
+    except Exception:
+        route = "business"
+        reason = f"Router returned invalid JSON. Raw response: {raw}"
+        confidence = 0.3
+
+    if route not in TOOL_REGISTRY:
+        route = "business"
+        reason = "Router returned unknown route, defaulted to business."
+        confidence = 0.3
+
+    return {
+        "route": route,
+        "route_reason": reason,
+        "route_confidence": confidence
+    }
+
+
+# -----------------------------
+# Tool: Calculator
+# Comes from: Python
+# Role: exact arithmetic instead of model guessing
+# -----------------------------
+def calculator_node(state: AumState):
+    question = state["question"]
+
+    expression = question.lower()
+    expression = expression.replace("×", "*")
+    expression = expression.replace("x", "*")
+    expression = expression.replace("÷", "/")
+    expression = expression.replace("plus", "+")
+    expression = expression.replace("minus", "-")
+    expression = expression.replace("times", "*")
+    expression = expression.replace("multiplied by", "*")
+    expression = expression.replace("divided by", "/")
+
+    expression = re.sub(r"[^0-9+\-*/().% ]", "", expression)
+    expression = expression.replace("%", "/100")
+
+    try:
+        result = eval(expression, {"__builtins__": {}})
+        answer = f"Calculator result: {result}"
+        tool_result = f"Calculated expression: {expression}"
+    except Exception:
+        answer = "I could not calculate that safely. Try a clearer expression like: 25 * 4 + 10."
+        tool_result = f"Calculator failed. Parsed expression: {expression}"
+
+    return {
+        "answer": answer,
+        "tool_result": tool_result,
+        "messages": update_memory(state, answer)
+    }
+
+
+# -----------------------------
+# Tool: CSV Analyzer
+# Upload: Streamlit file_uploader
+# Reading: pandas
+# Role: read real uploaded CSV and let Ollama explain summary
+# -----------------------------
+def csv_analyzer_node(state: AumState):
+    csv_summary = state.get("csv_summary", "")
+
+    if not csv_summary:
+        answer = "CSV analyzer was selected, but no CSV file is uploaded yet. Upload a CSV file first, then ask me to analyze it."
+        return {
+            "answer": answer,
+            "tool_result": "CSV analyzer selected, but no file found.",
+            "messages": update_memory(state, answer)
+        }
+
+    prompt = """
+You are a senior data analyst.
+
+Analyze the CSV summary below.
+Find useful business/data insights.
+Be practical and concise.
+
+Focus on:
+- row count and columns
+- numeric patterns
+- possible sales/revenue/unit insights
+- anomalies if visible
+- what the user should check next
+
+Do not invent columns or values that are not present.
+"""
+
+    response = ollama.chat(
+        model="qwen3:8b",
+        messages=[
+            {"role": "system", "content": prompt},
+            {
+                "role": "user",
+                "content": f"User question: {state['question']}\n\nCSV summary:\n{csv_summary}"
+            }
+        ]
+    )
+
+    answer = response["message"]["content"]
+
+    return {
+        "answer": answer,
+        "tool_result": "CSV analyzer used pandas summary + Ollama interpretation.",
+        "messages": update_memory(state, answer)
+    }
+
+
+# -----------------------------
+# Tool: PDF Reader with Intelligence
+# Upload: Streamlit file_uploader
+# Extraction: pypdf
+# Intelligence: our Python structure detection + Ollama
+# -----------------------------
+def pdf_reader_node(state: AumState):
+    pdf_text = state.get("pdf_text", "")
+    pdf_intelligence = state.get("pdf_intelligence", "")
+    pdf_chunks = state.get("pdf_chunks", [])
+
+    if not pdf_text:
+        answer = "PDF reader was selected, but no PDF file is uploaded yet. Upload a PDF file first, then ask me to summarize or explain it."
+        return {
+            "answer": answer,
+            "tool_result": "PDF reader selected, but no file found.",
+            "messages": update_memory(state, answer)
+        }
+
+    relevant_chunks = retrieve_relevant_pdf_chunks(
+        question=state["question"],
+        chunks=pdf_chunks,
+        top_k=5
+    )
+
+    if relevant_chunks:
+        context_parts = []
+
+        for chunk in relevant_chunks:
+            context_parts.append(
+                f"\n--- Relevant chunk from page {chunk['page']} | score {chunk['score']} ---\n{chunk['text']}"
+            )
+
+        rag_context = "\n".join(context_parts)
+        rag_mode = "RAG mode: relevant PDF chunks retrieved."
     else:
-        return {"route": "business"}
+        rag_context = pdf_text[:12000]
+        rag_mode = "Fallback mode: no strong chunk match, used beginning of PDF."
+
+    prompt = """
+You are a careful PDF document analyst.
+
+Use the PDF intelligence and retrieved PDF context below to answer the user's question.
+
+Rules:
+- Use only the PDF content provided.
+- Do not invent facts.
+- If the PDF does not contain the answer, say that clearly.
+- Prefer structured answers.
+- Mention page numbers when available.
+- If the document looks like a table of contents/preface/sample chapter, say that clearly.
+"""
+
+    response = ollama.chat(
+        model="qwen3:8b",
+        messages=[
+            {"role": "system", "content": prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"User question: {state['question']}\n\n"
+                    f"PDF intelligence:\n{pdf_intelligence[:8000]}\n\n"
+                    f"{rag_mode}\n\n"
+                    f"Retrieved PDF context:\n{rag_context}"
+                )
+            }
+        ]
+    )
+
+    answer = response["message"]["content"]
+
+    return {
+        "answer": answer,
+        "tool_result": f"{rag_mode} Chunks used: {len(relevant_chunks) if relevant_chunks else 0}",
+        "messages": update_memory(state, answer)
+    }
+    pdf_text = state.get("pdf_text", "")
+    pdf_intelligence = state.get("pdf_intelligence", "")
+
+    if not pdf_text:
+        answer = "PDF reader was selected, but no PDF file is uploaded yet. Upload a PDF file first, then ask me to summarize or explain it."
+        return {
+            "answer": answer,
+            "tool_result": "PDF reader selected, but no file found.",
+            "messages": update_memory(state, answer)
+        }
+
+    limited_pdf_text = pdf_text[:12000]
+    limited_pdf_intelligence = pdf_intelligence[:8000]
+
+    prompt = """
+You are a careful PDF document analyst.
+
+Use the PDF intelligence and PDF text below to answer the user's question.
+
+Rules:
+- Use only the PDF content provided.
+- Do not invent facts.
+- If the PDF does not contain the answer, say that clearly.
+- Prefer structured answers.
+- If page clues are available, mention pages or sections.
+- If the document looks like a table of contents/preface/sample chapter, say that clearly.
+- If the user asks for a summary, summarize by document structure, not as one generic paragraph.
+"""
+
+    response = ollama.chat(
+        model="qwen3:8b",
+        messages=[
+            {"role": "system", "content": prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"User question: {state['question']}\n\n"
+                    f"PDF intelligence:\n{limited_pdf_intelligence}\n\n"
+                    f"PDF text:\n{limited_pdf_text}"
+                )
+            }
+        ]
+    )
+
+    answer = response["message"]["content"]
+
+    return {
+        "answer": answer,
+        "tool_result": (
+            f"PDF intelligence used pypdf + structure detection. "
+            f"Text chars used: {len(limited_pdf_text)}"
+        ),
+        "messages": update_memory(state, answer)
+    }
+
+def chunk_pdf_pages(pages: List[Dict[str, str]], chunk_size: int = 1200, overlap: int = 200) -> List[Dict[str, str]]:
+    chunks = []
+
+    for page in pages:
+        page_number = page["page"]
+        text = page["text"]
+
+        if not text:
+            continue
+
+        start = 0
+
+        while start < len(text):
+            end = start + chunk_size
+            chunk_text = text[start:end]
+
+            chunks.append({
+                "page": page_number,
+                "text": chunk_text
+            })
+
+            start = end - overlap
+
+            if start < 0:
+                start = 0
+
+            if start >= len(text):
+                break
+
+    return chunks
 
 
+def tokenize(text: str) -> List[str]:
+    text = text.lower()
+    return re.findall(r"[a-zA-Z0-9]+", text)
+
+
+def retrieve_relevant_pdf_chunks(question: str, chunks: List[Dict[str, str]], top_k: int = 5) -> List[Dict[str, str]]:
+    if not chunks:
+        return []
+
+    question_tokens = set(tokenize(question))
+
+    scored_chunks = []
+
+    for chunk in chunks:
+        chunk_tokens = tokenize(chunk["text"])
+
+        if not chunk_tokens:
+            continue
+
+        chunk_token_set = set(chunk_tokens)
+
+        overlap_score = len(question_tokens.intersection(chunk_token_set))
+
+        # Small boost for exact phrase match
+        phrase_bonus = 0
+        if question.lower() in chunk["text"].lower():
+            phrase_bonus = 5
+
+        score = overlap_score + phrase_bonus
+
+        scored_chunks.append({
+            "page": chunk["page"],
+            "text": chunk["text"],
+            "score": score
+        })
+
+    scored_chunks.sort(key=lambda x: x["score"], reverse=True)
+
+    return [chunk for chunk in scored_chunks[:top_k] if chunk["score"] > 0]
+
+# -----------------------------
+# Tool: Web Search Placeholder
+# Role: avoids pretending local model browsed internet
+# -----------------------------
+# -----------------------------
+# Web Search helper
+# Comes from: ddgs Python package
+# Role: fetch live web search results for the web_search node
+# -----------------------------
+# -----------------------------
+# Web Search helper
+# Comes from: ddgs Python package
+# Role: fetch live web search results with title, URL, snippet
+# -----------------------------
+def run_web_search(query: str, max_results: int = 5) -> List[Dict[str, str]]:
+    try:
+        results = []
+
+        with DDGS() as ddgs:
+            search_results = ddgs.text(
+                query,
+                max_results=max_results
+            )
+
+            for item in search_results:
+                title = item.get("title", "No title")
+                url = item.get("href", "")
+                snippet = item.get("body", "")
+
+                results.append({
+                    "title": title,
+                    "url": url,
+                    "snippet": snippet
+                })
+
+        return results
+
+    except Exception as e:
+        return [{
+            "title": "Web search failed",
+            "url": "",
+            "snippet": str(e)
+        }]
+ 
+def format_web_sources_for_llm(web_sources: List[Dict[str, str]]) -> str:
+    if not web_sources:
+        return "No web search results found."
+
+    parts = []
+
+    for idx, source in enumerate(web_sources, start=1):
+        parts.append(
+            f"Source {idx}:\n"
+            f"Title: {source.get('title', '')}\n"
+            f"URL: {source.get('url', '')}\n"
+            f"Snippet: {source.get('snippet', '')}\n"
+        )
+
+    return "\n".join(parts)   
+
+# -----------------------------
+# Tool: Web Search
+# Search: ddgs
+# Role: retrieve current web results, then Ollama summarizes them
+# -----------------------------
+# -----------------------------
+# Tool: Web Search
+# Search: ddgs
+# Role: retrieve current web results, save sources, then Ollama summarizes them
+# -----------------------------
+def web_search_node(state: AumState):
+    query = state["question"]
+
+    web_sources = run_web_search(query, max_results=5)
+
+    if not web_sources:
+        answer = "I searched the web, but no useful results were found."
+
+        return {
+            "answer": answer,
+            "tool_result": "Web search returned no results.",
+            "web_sources": [],
+            "messages": update_memory(state, answer)
+        }
+
+    if web_sources[0]["title"] == "Web search failed":
+        answer = (
+            "I tried to search the web, but the search failed.\n\n"
+            f"Details: {web_sources[0]['snippet']}"
+        )
+
+        return {
+            "answer": answer,
+            "tool_result": f"Web search used {len(web_sources)} ddgs results.",
+            "web_sources": web_sources,
+            "messages": update_memory(state, answer)
+        }
+
+    search_context = format_web_sources_for_llm(web_sources)
+
+    prompt = """
+You are a careful web research assistant.
+
+Answer the user's question using only the search results below.
+
+Rules:
+- Do not claim you visited full web pages.
+- Say the answer is based on search result snippets.
+- Mention source titles when useful.
+- Include URLs only when useful.
+- If the results are weak, unclear, or conflicting, say that.
+- Be concise and practical.
+"""
+
+    response = ollama.chat(
+        model="qwen3:8b",
+        messages=[
+            {"role": "system", "content": prompt},
+            {
+                "role": "user",
+                "content": (
+                    f"User question: {state['question']}\n\n"
+                    f"Web search sources:\n{search_context}"
+                )
+            }
+        ]
+    )
+
+    answer = response["message"]["content"]
+
+    return {
+        "answer": answer,
+        "tool_result": f"Web search used {len(web_sources)} ddgs results.",
+        "web_sources": web_sources,
+        "messages": update_memory(state, answer)
+    }
+
+# -----------------------------
+# Normal Ollama nodes
+# -----------------------------
 def call_ollama(system_prompt: str, state: AumState):
-    messages = [{"role": "system", "content": system_prompt}]
+    saved_facts = load_user_facts()
+
+    memory_prompt = f"""
+            You have access to saved persistent user facts.
+            Saved facts:{saved_facts}
+            Use these facts when relevant.
+            Do not say you have no memory if saved facts are provided.
+            """
+
+    messages = [{"role": "system", "content": system_prompt + "\n\n" + memory_prompt}]
     messages.extend(state["messages"])
     messages.append({"role": "user", "content": state["question"]})
 
@@ -41,14 +726,9 @@ def call_ollama(system_prompt: str, state: AumState):
 
     answer = response["message"]["content"]
 
-    updated_messages = state["messages"] + [
-        {"role": "user", "content": state["question"]},
-        {"role": "assistant", "content": answer}
-    ]
-
     return {
         "answer": answer,
-        "messages": updated_messages
+        "messages": update_memory(state, answer)
     }
 
 
@@ -67,42 +747,443 @@ def business_node(state: AumState):
     return call_ollama(prompt, state)
 
 
+# -----------------------------
+# Better Tool Registry
+# Comes from: Python dictionary
+# Role: central route/tool registration
+# -----------------------------
+TOOL_REGISTRY: Dict[str, Callable] = {
+    "spiritual": spiritual_node,
+    "technical": technical_node,
+    "business": business_node,
+    "calculator": calculator_node,
+    "csv_analyzer": csv_analyzer_node,
+    "pdf_reader": pdf_reader_node,
+    "web_search": web_search_node,
+}
+
+
 def route_decision(state: AumState):
     return state["route"]
 
 
+# -----------------------------
+# CSV helper
+# -----------------------------
+def build_csv_summary(uploaded_file) -> str:
+    if uploaded_file is None:
+        return ""
+
+    df = pd.read_csv(uploaded_file)
+
+    row_count = len(df)
+    column_count = len(df.columns)
+    columns = list(df.columns)
+
+    numeric_df = df.select_dtypes(include="number")
+
+    summary_parts = []
+    summary_parts.append(f"Rows: {row_count}")
+    summary_parts.append(f"Columns count: {column_count}")
+    summary_parts.append(f"Columns: {columns}")
+
+    if not numeric_df.empty:
+        summary_parts.append("\nNumeric summary:")
+        summary_parts.append(numeric_df.describe().to_string())
+
+    summary_parts.append("\nFirst 5 rows:")
+    summary_parts.append(df.head(5).to_string(index=False))
+
+    return "\n".join(summary_parts)
+
+
+# -----------------------------
+# PDF helpers
+# -----------------------------
+def extract_pdf_pages(uploaded_file) -> List[Dict[str, str]]:
+    if uploaded_file is None:
+        return []
+
+    reader = PdfReader(uploaded_file)
+    pages = []
+
+    for page_number, page in enumerate(reader.pages, start=1):
+        page_text = page.extract_text() or ""
+        pages.append({
+            "page": str(page_number),
+            "text": page_text.strip()
+        })
+
+    return pages
+
+
+def build_pdf_text_from_pages(pages: List[Dict[str, str]]) -> str:
+    text_parts = []
+
+    for page in pages:
+        if page["text"]:
+            text_parts.append(f"\n--- Page {page['page']} ---\n{page['text']}")
+
+    return "\n".join(text_parts)
+
+
+def detect_possible_title(pages: List[Dict[str, str]]) -> str:
+    if not pages:
+        return "Unknown"
+
+    first_text = pages[0]["text"]
+    lines = [line.strip() for line in first_text.splitlines() if line.strip()]
+
+    # Pick first meaningful short line as title candidate
+    for line in lines[:10]:
+        if 5 <= len(line) <= 120:
+            return line
+
+    return "Unknown"
+
+
+def detect_document_type(full_text: str) -> str:
+    text = full_text.lower()
+
+    if "table of contents" in text and "preface" in text:
+        return "Book front matter / table of contents / preface"
+    if "table of contents" in text:
+        return "Document with table of contents"
+    if "preface" in text:
+        return "Book/document preface"
+    if "chapter" in text:
+        return "Book or chapter-based document"
+    if "benefits" in text or "coverage" in text or "deductible" in text:
+        return "Benefits / policy document"
+    if "agreement" in text or "contract" in text:
+        return "Agreement / contract document"
+    if "invoice" in text or "amount due" in text:
+        return "Invoice / billing document"
+    if "resume" in text or "experience" in text and "skills" in text:
+        return "Resume / profile document"
+
+    return "General PDF document"
+
+
+def extract_toc_candidates(pages: List[Dict[str, str]]) -> List[str]:
+    candidates = []
+
+    chapter_words = [
+        "one", "two", "three", "four", "five",
+        "six", "seven", "eight", "nine", "ten",
+        "eleven", "twelve", "thirteen", "fourteen", "fifteen"
+    ]
+
+    for page in pages[:15]:
+        lines = [line.strip() for line in page["text"].splitlines() if line.strip()]
+
+        for i, line in enumerate(lines):
+            lower = line.lower()
+
+            if len(line) > 160:
+                continue
+
+            # Direct TOC marker
+            if "table of contents" in lower:
+                candidates.append(f"Page {page['page']}: {line}")
+                continue
+
+            # Chapter 4 / Chapter 4: Title / Chapter Four
+            if re.search(r"\bchapter\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b", lower):
+                combined = line
+
+                # Add next line if it looks like chapter title
+                if i + 1 < len(lines):
+                    next_line = lines[i + 1].strip()
+                    if 3 <= len(next_line) <= 120:
+                        combined = f"{line} - {next_line}"
+
+                candidates.append(f"Page {page['page']}: {combined}")
+                continue
+
+            # 4. Working with Databases
+            if re.search(r"^\d+\.\s+[A-Za-z]", line):
+                candidates.append(f"Page {page['page']}: {line}")
+                continue
+
+            # 4 Working with Databases
+            if re.search(r"^\d+\s+[A-Z][A-Za-z]", line) and len(line) <= 120:
+                candidates.append(f"Page {page['page']}: {line}")
+                continue
+
+            # Title .... 89
+            if re.search(r"\.{2,}\s*\d+$", line):
+                candidates.append(f"Page {page['page']}: {line}")
+                continue
+
+            # Common book front matter / back matter
+            if any(word in lower for word in ["preface", "introduction", "appendix", "index"]):
+                if len(line) <= 120:
+                    candidates.append(f"Page {page['page']}: {line}")
+                    continue
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_candidates = []
+
+    for item in candidates:
+        if item not in seen:
+            unique_candidates.append(item)
+            seen.add(item)
+
+    return unique_candidates[:80]
+
+
+def extract_section_candidates(pages: List[Dict[str, str]]) -> List[str]:
+    sections = []
+
+    general_heading_words = [
+        "preface",
+        "introduction",
+        "chapter",
+        "appendix",
+        "summary",
+        "overview",
+        "getting started",
+        "installation",
+        "configuration",
+        "setup",
+        "conclusion",
+        "contents",
+        "table of contents",
+        "index",
+        "references",
+        "about the author",
+        "acknowledgements",
+        "requirements",
+        "examples",
+        "notes"
+    ]
+
+    for page in pages:
+        lines = [line.strip() for line in page["text"].splitlines() if line.strip()]
+
+        for i, line in enumerate(lines):
+            lower = line.lower()
+
+            if len(line) > 160:
+                continue
+
+            # Chapter 4 / Chapter Four
+            if re.search(
+                r"\bchapter\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen)\b",
+                lower
+            ):
+                combined = line
+
+                if i + 1 < len(lines):
+                    next_line = lines[i + 1].strip()
+                    if 3 <= len(next_line) <= 120:
+                        combined = f"{line} - {next_line}"
+
+                sections.append(f"Page {page['page']}: {combined}")
+                continue
+
+            # Part 1 / Part I
+            if re.search(r"\bpart\s+(\d+|i|ii|iii|iv|v|vi|vii|viii|ix|x)\b", lower):
+                sections.append(f"Page {page['page']}: {line}")
+                continue
+
+            # Section 2 / Section 2.1
+            if re.search(r"\bsection\s+\d+(\.\d+)*\b", lower):
+                sections.append(f"Page {page['page']}: {line}")
+                continue
+
+            # Numbered heading like 4. Something or 4.1 Something
+            if re.search(r"^\d+(\.\d+)*\.?\s+[A-Z][A-Za-z]", line):
+                sections.append(f"Page {page['page']}: {line}")
+                continue
+
+            # Appendix A / Appendix 1
+            if re.search(r"\bappendix\s+([a-z]|\d+)\b", lower):
+                sections.append(f"Page {page['page']}: {line}")
+                continue
+
+            # General document heading words
+            if any(word in lower for word in general_heading_words):
+                sections.append(f"Page {page['page']}: {line}")
+                continue
+
+            # Uppercase heading, but avoid noisy publisher/address lines
+            if line.isupper() and 4 <= len(line) <= 100:
+                noisy_words = ["isbn", "copyright", "published", "mumbai", "birmingham"]
+                if not any(noisy in lower for noisy in noisy_words):
+                    sections.append(f"Page {page['page']}: {line}")
+                continue
+
+    seen = set()
+    unique_sections = []
+
+    for section in sections:
+        if section not in seen:
+            unique_sections.append(section)
+            seen.add(section)
+
+    return unique_sections[:100]
+
+def build_pdf_intelligence(pages: List[Dict[str, str]]) -> str:
+    if not pages:
+        return ""
+
+    full_text = build_pdf_text_from_pages(pages)
+
+    page_count = len(pages)
+    title = detect_possible_title(pages)
+    document_type = detect_document_type(full_text)
+    total_chars = len(full_text)
+
+    non_empty_pages = [p for p in pages if p["text"].strip()]
+    empty_page_count = page_count - len(non_empty_pages)
+
+    toc_candidates = extract_toc_candidates(pages)
+    section_candidates = extract_section_candidates(pages)
+
+    intelligence_parts = []
+
+    intelligence_parts.append("PDF INTELLIGENCE REPORT")
+    intelligence_parts.append(f"Possible title: {title}")
+    intelligence_parts.append(f"Detected document type: {document_type}")
+    intelligence_parts.append(f"Total pages: {page_count}")
+    intelligence_parts.append(f"Pages with extracted text: {len(non_empty_pages)}")
+    intelligence_parts.append(f"Pages with no extracted text: {empty_page_count}")
+    intelligence_parts.append(f"Total extracted characters: {total_chars}")
+
+    if toc_candidates:
+        intelligence_parts.append("\nPossible table of contents / chapter entries:")
+        for item in toc_candidates:
+            intelligence_parts.append(f"- {item}")
+    else:
+        intelligence_parts.append("\nPossible table of contents / chapter entries: Not detected")
+
+    if section_candidates:
+        intelligence_parts.append("\nPossible section/headings:")
+        for item in section_candidates:
+            intelligence_parts.append(f"- {item}")
+    else:
+        intelligence_parts.append("\nPossible section/headings: Not detected")
+
+    if empty_page_count > 0:
+        intelligence_parts.append(
+            "\nWarning: Some pages had no extractable text. "
+            "The PDF may contain scanned images or image-based pages."
+        )
+
+    return "\n".join(intelligence_parts)
+
+
+# -----------------------------
+# LangGraph
+# -----------------------------
 builder = StateGraph(AumState)
 
 builder.add_node("router", router_node)
-builder.add_node("spiritual", spiritual_node)
-builder.add_node("technical", technical_node)
-builder.add_node("business", business_node)
+
+for tool_name, tool_function in TOOL_REGISTRY.items():
+    builder.add_node(tool_name, tool_function)
 
 builder.add_edge(START, "router")
 
 builder.add_conditional_edges(
     "router",
     route_decision,
-    {
-        "spiritual": "spiritual",
-        "technical": "technical",
-        "business": "business"
-    }
+    {tool_name: tool_name for tool_name in TOOL_REGISTRY.keys()}
 )
 
-builder.add_edge("spiritual", END)
-builder.add_edge("technical", END)
-builder.add_edge("business", END)
+for tool_name in TOOL_REGISTRY.keys():
+    builder.add_edge(tool_name, END)
 
 graph = builder.compile()
 
 
+# -----------------------------
+# Streamlit UI
+# -----------------------------
 st.set_page_config(page_title="AUM State", page_icon="ॐ")
 st.title("AUM State")
 st.caption("AI for clarity, work, and wisdom")
 
+init_memory_db()
+
 if "messages" not in st.session_state:
-    st.session_state.messages = []
+    st.session_state.messages = load_messages_from_db(limit=30)
+
+if "csv_summary" not in st.session_state:
+    st.session_state.csv_summary = ""
+
+if "pdf_text" not in st.session_state:
+    st.session_state.pdf_text = ""
+
+if "pdf_intelligence" not in st.session_state:
+    st.session_state.pdf_intelligence = ""
+
+if "pdf_chunks" not in st.session_state:
+    st.session_state.pdf_chunks = []
+if "web_sources" not in st.session_state:
+    st.session_state.web_sources = []
+
+st.sidebar.header("Tools")
+
+# Feature: CSV upload
+# Comes from: Streamlit file_uploader
+csv_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
+
+if csv_file is not None:
+    try:
+        st.session_state.csv_summary = build_csv_summary(csv_file)
+        st.sidebar.success("CSV loaded successfully.")
+    except Exception as e:
+        st.sidebar.error(f"CSV load failed: {e}")
+        st.session_state.csv_summary = ""
+
+
+# Feature: PDF upload
+# Comes from: Streamlit file_uploader
+pdf_file = st.sidebar.file_uploader("Upload PDF", type=["pdf"])
+
+if pdf_file is not None:
+    try:
+        pdf_pages = extract_pdf_pages(pdf_file)
+        st.session_state.pdf_text = build_pdf_text_from_pages(pdf_pages)
+        st.session_state.pdf_intelligence = build_pdf_intelligence(pdf_pages)
+        st.session_state.pdf_chunks = chunk_pdf_pages(pdf_pages)
+
+        if st.session_state.pdf_text.strip():
+            st.sidebar.success(f"PDF loaded with intelligence. Chunks: {len(st.session_state.pdf_chunks)}")
+        else:
+            st.sidebar.warning("PDF loaded, but no text was extracted. It may be scanned/image-based.")
+    except Exception as e:
+        st.sidebar.error(f"PDF load failed: {e}")
+        st.session_state.pdf_text = ""
+        st.session_state.pdf_intelligence = ""
+
+
+with st.sidebar.expander("PDF Intelligence Preview"):
+    if st.session_state.pdf_intelligence:
+        st.text(st.session_state.pdf_intelligence[:3000])
+    else:
+        st.caption("Upload a PDF to see document intelligence.")
+
+with st.sidebar.expander("Last Web Search Sources"):
+    if st.session_state.web_sources:
+        for idx, source in enumerate(st.session_state.web_sources, start=1):
+            title = source.get("title", "No title")
+            url = source.get("url", "")
+            snippet = source.get("snippet", "")
+
+            if url:
+                st.markdown(f"**{idx}. [{title}]({url})**")
+            else:
+                st.markdown(f"**{idx}. {title}**")
+
+            if snippet:
+                st.caption(snippet)
+    else:
+        st.caption("No web search sources yet.")
 
 question = st.text_area("Ask AUM State:")
 
@@ -116,34 +1197,53 @@ with col2:
 
 if clear_clicked:
     st.session_state.messages = []
-    st.success("Memory cleared.")
+    clear_memory_db()
+    clear_user_facts()
+    st.success("Memory cleared from session, chat history, and saved facts.")
 
 if ask_clicked and question:
     with st.spinner("Thinking..."):
         result = graph.invoke({
             "question": question,
             "route": "",
+            "route_reason": "",
+            "route_confidence": 0.0,
             "answer": "",
-            "messages": st.session_state.messages
+            "messages": st.session_state.messages,
+            "tool_result": "",
+            "csv_summary": st.session_state.csv_summary,
+            "pdf_text": st.session_state.pdf_text,
+            "pdf_intelligence": st.session_state.pdf_intelligence,
+            "pdf_chunks": st.session_state.pdf_chunks,
+            "web_sources": st.session_state.web_sources
         })
 
         st.session_state.messages = result["messages"]
+        if "web_sources" in result and result["web_sources"]:
+            st.session_state.web_sources = result["web_sources"]
 
         st.caption(f"Routed to: {result['route']}")
+        st.caption(f"Reason: {result['route_reason']}")
+        st.caption(f"Confidence: {round(result['route_confidence'] * 100, 1)}%")
+
+        if result.get("tool_result"):
+            st.caption(f"Tool: {result['tool_result']}")
+
         st.write(result["answer"])
 
 st.divider()
 
 st.subheader("Memory / Chat History")
+st.caption(f"Persistent memory file: {DB_PATH}")
+
+st.subheader("Saved User Facts")
+st.text(load_user_facts())
 
 if st.session_state.messages:
     for msg in st.session_state.messages:
-        role = msg["role"]
-        content = msg["content"]
-
-        if role == "user":
-            st.markdown(f"**You:** {content}")
+        if msg["role"] == "user":
+            st.markdown(f"**You:** {msg['content']}")
         else:
-            st.markdown(f"**AUM State:** {content}")
+            st.markdown(f"**AUM State:** {msg['content']}")
 else:
     st.caption("No memory yet.")
