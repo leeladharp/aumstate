@@ -1,0 +1,9 @@
+streamlit
+ollama
+pandas
+ddgs
+pypdf
+langgraph
+Pillow
+openai
+pytest
