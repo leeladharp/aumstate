@@ -1,20 +1,37 @@
 import base64
 import json
+import math
+import os
 import shutil
 import subprocess
 import tempfile
 import unittest
+import wave
 from pathlib import Path
 from unittest.mock import patch
 
 from PIL import Image
 
+from creative_models import (
+    AmbiguityInsight,
+    CreativeEvaluation,
+    CreativeRequest,
+    CreativeResult,
+    DirectorDecision,
+    PhilosophyInsight,
+    PsychologyInsight,
+    StoryDraft,
+)
 from video_agent import (
+    DEFAULT_VISUAL_STYLE,
     DEFAULT_IMAGE_QUALITY,
+    DEFAULT_VIDEO_MODE,
     VideoScene,
     build_fallback_plan,
     build_scene_durations,
+    build_video_plan_from_creative_result,
     build_video_settings,
+    normalize_content_type,
     narration_word_target,
     settings_changed,
     settings_snapshot,
@@ -22,15 +39,25 @@ from video_agent import (
     validate_video_plan_data,
 )
 from video_providers import (
+    AUDIBLE_AUDIO_THRESHOLD_DB,
+    NarrationAudioInfo,
+    OpenAISpeechProvider,
     OpenAIImageProvider,
     PlaceholderImageProvider,
+    SilentSpeechProvider,
     build_openai_image_prompt,
     create_silent_wav,
     generate_narration_audio,
     generate_scene_images,
+    get_config_value,
+    get_openai_tts_model,
+    inspect_narration_audio_file,
+    is_video_dev_mode,
+    load_app_config,
     map_quality_label_to_openai,
     normalize_quality_label,
     select_image_provider,
+    select_speech_provider,
 )
 from video_renderer import (
     DEFAULT_OUTPUT_FPS,
@@ -82,6 +109,10 @@ class MockOpenAIClient:
 
 
 class MockSpeechProvider:
+    provider_name = "MockSpeech"
+    model_name = "mock-model"
+    requires_audible_audio = True
+
     def __init__(self, durations: list[float]) -> None:
         self.durations = durations
         self.calls = []
@@ -93,7 +124,58 @@ class MockSpeechProvider:
         return type("Result", (), {"path": output_path, "used_fallback": False, "message": "Generated speech."})()
 
 
+class MockSpeechResponse:
+    def __init__(self, audio_bytes: bytes) -> None:
+        self.audio_bytes = audio_bytes
+
+    def write_to_file(self, output_path: Path) -> None:
+        output_path.write_bytes(self.audio_bytes)
+
+
+class MockSpeechAPI:
+    def __init__(self, audio_bytes: bytes) -> None:
+        self.audio_bytes = audio_bytes
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return MockSpeechResponse(self.audio_bytes)
+
+
+class MockAudioAPI:
+    def __init__(self, audio_bytes: bytes) -> None:
+        self.speech = MockSpeechAPI(audio_bytes)
+
+
+class MockOpenAITTSClient:
+    def __init__(self, audio_bytes: bytes) -> None:
+        self.audio = MockAudioAPI(audio_bytes)
+
+
+def create_tone_wav_bytes(duration_seconds: float = 1.0, sample_rate: int = 22050) -> bytes:
+    frame_count = int(sample_rate * duration_seconds)
+    amplitude = 12000
+    buffer = tempfile.SpooledTemporaryFile()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        frames = bytearray()
+        for index in range(frame_count):
+            sample = int(amplitude * math.sin(2 * math.pi * 440 * (index / sample_rate)))
+            frames.extend(sample.to_bytes(2, byteorder="little", signed=True))
+        wav_file.writeframes(bytes(frames))
+    buffer.seek(0)
+    data = buffer.read()
+    buffer.close()
+    return data
+
+
 class VideoAgentTests(unittest.TestCase):
+    def test_basic_motion_is_default_video_mode(self) -> None:
+        settings = build_video_settings()
+        self.assertEqual(settings.video_mode, DEFAULT_VIDEO_MODE)
+
     def test_scene_durations_15_over_5(self) -> None:
         self.assertEqual(build_scene_durations(15, 5), [5, 5, 5])
 
@@ -163,6 +245,14 @@ class VideoAgentTests(unittest.TestCase):
         self.assertEqual([scene.duration_seconds for scene in plan.scenes], settings.scene_durations)
         self.assertEqual(total_duration_seconds(plan.scenes), settings.total_duration_seconds)
 
+    def test_build_video_settings_normalizes_new_content_type_labels(self) -> None:
+        settings = build_video_settings(content_type="Human Behavior", visual_style="")
+        self.assertEqual(settings.content_type, "human_behavior")
+        self.assertEqual(settings.visual_style, DEFAULT_VISUAL_STYLE)
+
+    def test_normalize_content_type_accepts_human_readable_label(self) -> None:
+        self.assertEqual(normalize_content_type("Spiritual Reflection"), "spiritual_reflection")
+
     def test_generate_scene_images_falls_back_to_placeholder_files_in_dev_mode(self) -> None:
         settings = build_video_settings()
         plan = build_fallback_plan(
@@ -193,6 +283,172 @@ class VideoAgentTests(unittest.TestCase):
         self.assertIsNone(audio_path)
         self.assertEqual(message, "Narration disabled.")
 
+    def test_missing_video_dev_mode_defaults_to_production_mode(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            load_app_config(force=True)
+            self.assertFalse(is_video_dev_mode())
+
+    def test_video_dev_mode_true_selects_silent_speech_provider(self) -> None:
+        settings = build_video_settings()
+        with patch.dict(os.environ, {"VIDEO_DEV_MODE": "true"}, clear=True):
+            load_app_config(force=True)
+            provider = select_speech_provider(settings=settings)
+        self.assertIsInstance(provider, SilentSpeechProvider)
+
+    def test_video_dev_mode_false_selects_openai_speech_provider(self) -> None:
+        settings = build_video_settings()
+        with patch.dict(os.environ, {"VIDEO_DEV_MODE": "false"}, clear=True):
+            load_app_config(force=True)
+            provider = select_speech_provider(settings=settings)
+        self.assertIsInstance(provider, OpenAISpeechProvider)
+
+    def test_dotenv_values_are_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dotenv_path = Path(temp_dir) / ".env"
+            dotenv_path.write_text(
+                "VIDEO_DEV_MODE=true\nOPENAI_API_KEY=dotenv-key\nOPENAI_TTS_MODEL=dotenv-model\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {}, clear=True):
+                load_app_config(force=True, dotenv_path=dotenv_path)
+                self.assertTrue(is_video_dev_mode())
+                self.assertEqual(get_config_value("OPENAI_API_KEY"), "dotenv-key")
+                self.assertEqual(get_openai_tts_model(), "dotenv-model")
+
+    def test_environment_variables_override_dotenv(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dotenv_path = Path(temp_dir) / ".env"
+            dotenv_path.write_text("OPENAI_API_KEY=dotenv-key\n", encoding="utf-8")
+            with patch.dict(os.environ, {"OPENAI_API_KEY": "env-key"}, clear=True):
+                load_app_config(force=True, dotenv_path=dotenv_path)
+                self.assertEqual(get_config_value("OPENAI_API_KEY"), "env-key")
+
+    def test_streamlit_secrets_fallback_is_used(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("video_providers.get_streamlit_secret", return_value="secret-key"):
+                self.assertEqual(get_config_value("OPENAI_API_KEY"), "secret-key")
+
+    def test_missing_production_api_key_raises_actionable_error(self) -> None:
+        settings = build_video_settings()
+        with patch.dict(os.environ, {"VIDEO_DEV_MODE": "false"}, clear=True):
+            load_app_config(force=True)
+            provider = OpenAISpeechProvider(settings=settings, client=object())
+            with self.assertRaisesRegex(
+                ValueError,
+                "OPENAI_API_KEY is missing. Configure it before generating real narration.",
+            ):
+                provider.generate_narration_audio("Hello world", Path(tempfile.mkdtemp()) / "narration.wav")
+
+    def test_mocked_openai_tts_receives_model_voice_text_style_and_speed(self) -> None:
+        settings = build_video_settings(
+            voice="Warm Female",
+            speaking_style="Calm",
+            speaking_speed="Fast",
+            language="English",
+        )
+        client = MockOpenAITTSClient(create_tone_wav_bytes())
+        with patch.dict(
+            os.environ,
+            {
+                "VIDEO_DEV_MODE": "false",
+                "OPENAI_API_KEY": "test-key",
+                "OPENAI_TTS_MODEL": "gpt-4o-mini-tts",
+            },
+            clear=True,
+        ):
+            load_app_config(force=True)
+            provider = OpenAISpeechProvider(settings=settings, client=client)
+            with tempfile.TemporaryDirectory() as temp_dir:
+                output_path = Path(temp_dir) / "narration.wav"
+                result = provider.generate_narration_audio("Narration text", output_path)
+                self.assertTrue(result.path.exists())
+        call = client.audio.speech.calls[0]
+        self.assertEqual(call["model"], "gpt-4o-mini-tts")
+        self.assertEqual(call["voice"], "coral")
+        self.assertEqual(call["input"], "Narration text")
+        self.assertIn("Speaking style: Calm", call["instructions"])
+        self.assertEqual(call["speed"], 1.1)
+        self.assertEqual(call["response_format"], "wav")
+
+    def test_valid_audio_file_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = Path(temp_dir) / "narration.wav"
+            audio_path.write_bytes(create_tone_wav_bytes())
+            with patch("video_providers.probe_audio_file", return_value={"streams": [{"codec_type": "audio", "codec_name": "pcm_s16le"}], "format": {"duration": "1.0"}}):
+                with patch("video_providers.get_audio_max_volume_db", return_value=-12.0):
+                    info = inspect_narration_audio_file(audio_path, provider_name="OpenAI", model_name="gpt-4o-mini-tts")
+            self.assertTrue(info.contains_audible_audio)
+            self.assertEqual(info.codec_name, "pcm_s16le")
+
+    def test_empty_audio_file_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = Path(temp_dir) / "empty.wav"
+            audio_path.write_bytes(b"")
+            with self.assertRaisesRegex(ValueError, "Narration file is empty"):
+                inspect_narration_audio_file(audio_path)
+
+    def test_silent_audio_file_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = Path(temp_dir) / "silent.wav"
+            audio_path.write_bytes(create_tone_wav_bytes())
+            with patch("video_providers.probe_audio_file", return_value={"streams": [{"codec_type": "audio", "codec_name": "pcm_s16le"}], "format": {"duration": "1.0"}}):
+                with patch("video_providers.get_audio_max_volume_db", return_value=-91.0):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "Narration was generated, but the audio is silent or invalid. Please retry narration generation.",
+                    ):
+                        inspect_narration_audio_file(audio_path)
+
+    def test_negative_ninety_one_db_audio_fails_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = Path(temp_dir) / "quiet.wav"
+            audio_path.write_bytes(create_tone_wav_bytes())
+            with patch("video_providers.probe_audio_file", return_value={"streams": [{"codec_type": "audio", "codec_name": "pcm_s16le"}], "format": {"duration": "1.0"}}):
+                with patch("video_providers.get_audio_max_volume_db", return_value=-91.0):
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        "Narration was generated, but the audio is silent or invalid. Please retry narration generation.",
+                    ):
+                        inspect_narration_audio_file(audio_path)
+
+    def test_audible_audio_succeeds_above_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = Path(temp_dir) / "audible.wav"
+            audio_path.write_bytes(create_tone_wav_bytes())
+            with patch("video_providers.probe_audio_file", return_value={"streams": [{"codec_type": "audio", "codec_name": "pcm_s16le"}], "format": {"duration": "1.0"}}):
+                with patch("video_providers.get_audio_max_volume_db", return_value=AUDIBLE_AUDIO_THRESHOLD_DB + 1.0):
+                    info = inspect_narration_audio_file(audio_path)
+            self.assertTrue(info.contains_audible_audio)
+
+    def test_non_audio_file_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            audio_path = Path(temp_dir) / "not_audio.wav"
+            audio_path.write_bytes(b"not audio")
+            with patch("video_providers.probe_audio_file", return_value={"streams": [], "format": {"duration": "1.0"}}):
+                with self.assertRaisesRegex(ValueError, "does not contain a readable audio stream"):
+                    inspect_narration_audio_file(audio_path)
+
+    def test_narration_retry_does_not_regenerate_images(self) -> None:
+        settings = build_video_settings(total_duration_seconds=10)
+        plan = build_fallback_plan("A short story", settings=settings)
+        provider = MockSpeechProvider([12.0, 8.0])
+
+        with patch("video_providers.inspect_narration_audio_file", side_effect=[
+            NarrationAudioInfo(Path("narration.wav"), True, 100, 12.0, True, True, "pcm_s16le", "MockSpeech", "mock-model"),
+            NarrationAudioInfo(Path("narration_retry.wav"), True, 100, 8.0, True, True, "pcm_s16le", "MockSpeech", "mock-model"),
+        ]):
+            with patch("video_providers.shorten_narration_once", return_value="Shortened narration"):
+                with patch("video_providers.generate_scene_images") as image_generation_mock:
+                    with tempfile.TemporaryDirectory() as temp_dir:
+                        audio_path, _ = generate_narration_audio(
+                            plan=plan,
+                            output_dir=Path(temp_dir),
+                            settings=settings,
+                            speech_provider=provider,
+                        )
+        self.assertIsNotNone(audio_path)
+        image_generation_mock.assert_not_called()
+
     def test_narration_target_changes_with_duration(self) -> None:
         self.assertEqual(
             narration_word_target(build_video_settings(total_duration_seconds=10)),
@@ -208,17 +464,24 @@ class VideoAgentTests(unittest.TestCase):
         plan = build_fallback_plan("A short story", settings=settings)
         provider = MockSpeechProvider([12.0, 8.0])
 
-        with patch("video_providers.shorten_narration_once", return_value="Shortened narration"):
-            with tempfile.TemporaryDirectory() as temp_dir:
-                audio_path, message = generate_narration_audio(
-                    plan=plan,
-                    output_dir=Path(temp_dir),
-                    settings=settings,
-                    speech_provider=provider,
-                )
-                self.assertTrue(audio_path.exists())
-                self.assertEqual(len(provider.calls), 2)
-                self.assertIn("shortened once", message.lower())
+        with patch(
+            "video_providers.inspect_narration_audio_file",
+            side_effect=[
+                NarrationAudioInfo(Path("narration.wav"), True, 100, 12.0, True, True, "pcm_s16le", "MockSpeech", "mock-model"),
+                NarrationAudioInfo(Path("narration_retry.wav"), True, 100, 8.0, True, True, "pcm_s16le", "MockSpeech", "mock-model"),
+            ],
+        ):
+            with patch("video_providers.shorten_narration_once", return_value="Shortened narration"):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    audio_path, message = generate_narration_audio(
+                        plan=plan,
+                        output_dir=Path(temp_dir),
+                        settings=settings,
+                        speech_provider=provider,
+                    )
+                    self.assertTrue(audio_path.exists())
+                    self.assertEqual(len(provider.calls), 2)
+                    self.assertIn("shortened once", message.lower())
 
     def test_state_change_detection_for_duration(self) -> None:
         settings = build_video_settings(total_duration_seconds=15)
@@ -242,6 +505,12 @@ class VideoAgentTests(unittest.TestCase):
         settings = build_video_settings(voice="Warm Female")
         snapshot = settings_snapshot(settings)
         updated = build_video_settings(voice="Warm Male")
+        self.assertTrue(settings_changed(snapshot, updated))
+
+    def test_state_change_detection_for_video_mode(self) -> None:
+        settings = build_video_settings(video_mode="basic_motion")
+        snapshot = settings_snapshot(settings)
+        updated = build_video_settings(video_mode="kling_assisted")
         self.assertTrue(settings_changed(snapshot, updated))
 
     def test_quality_mapping_draft_maps_to_low(self) -> None:
@@ -314,6 +583,146 @@ class VideoAgentTests(unittest.TestCase):
         self.assertIn(scene.motion_prompt, prompt)
         self.assertIn("hairstyle", prompt.lower())
         self.assertIn("hair length", prompt.lower())
+        self.assertNotIn("large expressive eyes", prompt.lower())
+        self.assertNotIn("bright pastel colors", prompt.lower())
+
+    def test_build_openai_image_prompt_keeps_provider_neutral_for_philosophy(self) -> None:
+        settings = build_video_settings(content_type="philosophy", visual_style="Quiet Cinematic Animation")
+        plan = build_fallback_plan("A quiet reflection on impermanence", settings=settings)
+        prompt = build_openai_image_prompt(plan=plan, scene=plan.scenes[0])
+        self.assertNotIn("nursery", prompt.lower())
+        self.assertIn("style lock", prompt.lower())
+
+    def test_build_openai_image_prompt_allows_nursery_via_style_lock(self) -> None:
+        settings = build_video_settings(content_type="nursery", visual_style="3D Nursery Animation")
+        plan = build_fallback_plan("A nursery story", settings=settings)
+        prompt = build_openai_image_prompt(plan=plan, scene=plan.scenes[0])
+        self.assertIn("3D Nursery Animation", prompt)
+
+    def test_build_video_plan_from_creative_result_returns_valid_plan(self) -> None:
+        settings = build_video_settings(total_duration_seconds=15, preferred_scene_duration_seconds=5, content_type="story")
+        creative_result = CreativeResult(
+            request=CreativeRequest(
+                idea="A reflective short story about status anxiety",
+                content_type="story",
+                tone="reflective",
+                target_audience="general",
+                language="English",
+                duration_seconds=15,
+                visual_style="Quiet Cinematic Animation",
+            ),
+            director=DirectorDecision(
+                content_intent="human truth",
+                emotional_tone="reflective",
+                narrative_shape="contradiction_to_reveal",
+                use_psychology=True,
+                use_philosophy=False,
+                use_humor=False,
+                use_ambiguity=True,
+                humor_level="off",
+                philosophy_level="light",
+                psychology_level="high",
+                ambiguity_level="balanced",
+                story_focus="show contradiction through behavior",
+                rationale="The request is behavior-driven.",
+            ),
+            psychology=PsychologyInsight(
+                visible_behavior="He boasts casually.",
+                hidden_motive="He wants reassurance.",
+                emotional_trigger="Comparison.",
+                contradiction="He dismisses approval while seeking it.",
+                audience_rel_path="People recognize this instantly.",
+            ),
+            philosophy=PhilosophyInsight(
+                central_question="",
+                deeper_meaning="",
+                tension="",
+                possible_closing_thought="",
+                avoid_preaching="yes",
+            ),
+            humor=None,
+            ambiguity=AmbiguityInsight(
+                competing_interpretations=["Status anxiety", "Nervous habit"],
+                unresolved_question="Does he know he is doing it?",
+                contradiction="Confidence mixed with insecurity",
+                what_not_to_explain="Do not declare one motive as final truth.",
+                ambiguity_strength="balanced",
+            ),
+            story=StoryDraft(
+                premise="A man performs confidence while tracking approval.",
+                conflict="His actions contradict his words.",
+                progression="He checks reactions more and more often.",
+                emotional_turn="He catches himself in the act.",
+                ending="The silence says more than the speech.",
+                scene_beats=["Claim indifference", "Check reactions", "Reveal contradiction"],
+            ),
+            critic=CreativeEvaluation(
+                relatability_score=8,
+                humor_score=4,
+                psychological_truth_score=9,
+                philosophical_depth_score=3,
+                ambiguity_score=7,
+                preachiness_score=2,
+                originality_score=7,
+                clarity_score=8,
+                forced_humor_score=1,
+                unnecessary_explanation_score=2,
+                notes="Keep it concise.",
+                edit_instructions=["Trim obvious lines", "Let the final image carry the ending"],
+            ),
+            final_story=StoryDraft(
+                premise="A man says he does not care what people think, then checks who watched his status.",
+                conflict="His self-image and behavior clash.",
+                progression="Each refresh exposes more neediness.",
+                emotional_turn="He notices his own contradiction.",
+                ending="The phone glow becomes the punchline.",
+                scene_beats=["Claim indifference", "Repeated checking", "Quiet self-reveal"],
+            ),
+            selected_specialists=["psychology", "ambiguity", "story", "critic"],
+        )
+        raw_plan = {
+            "title": "Status Check",
+            "content_type": "story",
+            "duration_seconds": 15,
+            "aspect_ratio": "9:16",
+            "narration": "He says he does not care what people think. Then he checks who watched his status again.",
+            "style_lock": "Quiet Cinematic Animation. Keep the same man, phone, outfit, and apartment lighting in every scene.",
+            "scenes": [
+                {
+                    "scene_number": 1,
+                    "duration_seconds": 5,
+                    "narration": "He shrugs and says other opinions mean nothing to him.",
+                    "visual_prompt": "A man acts casual in his apartment, phone face down on the table.",
+                    "motion_prompt": "Gentle push in.",
+                },
+                {
+                    "scene_number": 2,
+                    "duration_seconds": 5,
+                    "narration": "Seconds later, his hand flips the phone to check who viewed his status.",
+                    "visual_prompt": "The same man refreshes his WhatsApp status viewers with anxious focus.",
+                    "motion_prompt": "Subtle zoom on the glowing phone.",
+                },
+                {
+                    "scene_number": 3,
+                    "duration_seconds": 5,
+                    "narration": "He catches himself doing it and says nothing.",
+                    "visual_prompt": "The room goes quiet as he stares at the screen and then at himself.",
+                    "motion_prompt": "Hold on his expression.",
+                },
+            ],
+        }
+
+        with patch("video_agent.request_video_plan_from_ollama", return_value=json.dumps(raw_plan)):
+            plan, warning = build_video_plan_from_creative_result(
+                idea=creative_result.request.idea,
+                creative_result=creative_result,
+                settings=settings,
+            )
+
+        self.assertIsNone(warning)
+        self.assertEqual(len(plan.scenes), settings.scene_count)
+        self.assertEqual([scene.duration_seconds for scene in plan.scenes], settings.scene_durations)
+        self.assertEqual(plan.content_type, "story")
 
     def test_calculate_frame_count_respects_selected_fps(self) -> None:
         self.assertEqual(calculate_frame_count(duration_seconds=10, fps=24), 240)

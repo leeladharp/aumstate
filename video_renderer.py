@@ -18,10 +18,22 @@ def ffmpeg_exists() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+def ffprobe_exists() -> bool:
+    return shutil.which("ffprobe") is not None
+
+
 def ensure_ffmpeg_available() -> None:
     if not ffmpeg_exists():
         raise RuntimeError(
             "FFmpeg is not installed or not on PATH. Install ffmpeg to render videos, "
+            "for example with: sudo apt install -y ffmpeg"
+        )
+
+
+def ensure_ffprobe_available() -> None:
+    if not ffprobe_exists():
+        raise RuntimeError(
+            "ffprobe is not installed or not on PATH. Install ffmpeg/ffprobe to validate imported videos, "
             "for example with: sudo apt install -y ffmpeg"
         )
 
@@ -66,6 +78,19 @@ def run_ffmpeg(command: list[str]) -> None:
     if process.returncode != 0:
         error_output = process.stderr.strip() or process.stdout.strip() or "Unknown FFmpeg error"
         raise RuntimeError(f"FFmpeg command failed: {error_output}")
+
+
+def run_subprocess(command: list[str]) -> subprocess.CompletedProcess[str]:
+    process = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if process.returncode != 0:
+        error_output = process.stderr.strip() or process.stdout.strip() or "Unknown subprocess error"
+        raise RuntimeError(error_output)
+    return process
 
 
 def build_scene_render_command(
@@ -119,15 +144,30 @@ def render_scene_clip(
 
 
 def write_concat_manifest(clip_paths: list[Path], manifest_path: Path) -> Path:
-    lines = [f"file '{clip_path.name}'" for clip_path in clip_paths]
+    lines = [f"file '{escape_concat_path(clip_path.resolve())}'" for clip_path in clip_paths]
     manifest_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return manifest_path
 
 
+def escape_concat_path(path: Path) -> str:
+    return str(path).replace("'", r"'\''")
+
+
+def validate_concat_inputs(clip_paths: list[Path]) -> list[Path]:
+    resolved_paths: list[Path] = []
+    for index, clip_path in enumerate(clip_paths, start=1):
+        resolved_path = clip_path.resolve()
+        if not resolved_path.exists() or not resolved_path.is_file():
+            raise FileNotFoundError(f"Missing concat input for scene {index}: {resolved_path}")
+        resolved_paths.append(resolved_path)
+    return resolved_paths
+
+
 def concat_scene_clips(clip_paths: list[Path], output_path: Path) -> Path:
     ensure_ffmpeg_available()
+    resolved_paths = validate_concat_inputs(clip_paths=clip_paths)
     manifest_path = output_path.parent / "concat_manifest.txt"
-    write_concat_manifest(clip_paths=clip_paths, manifest_path=manifest_path)
+    write_concat_manifest(clip_paths=resolved_paths, manifest_path=manifest_path)
 
     command = [
         "ffmpeg",

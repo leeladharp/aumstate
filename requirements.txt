@@ -6,4 +6,5 @@ pypdf
 langgraph
 Pillow
 openai
+python-dotenv
 pytest

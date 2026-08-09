@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-import math
 import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
 import ollama
+
+from creative_models import CreativeResult
 
 
 OLLAMA_MODEL = "qwen3:8b"
@@ -14,9 +15,10 @@ DEFAULT_TOTAL_DURATION_SECONDS = 15
 DEFAULT_SCENE_DURATION_SECONDS = 5
 DEFAULT_FRAME_RATE = 30
 DEFAULT_ASPECT_RATIO_LABEL = "Vertical 9:16"
-DEFAULT_VISUAL_STYLE = "3D Nursery Animation"
+DEFAULT_VISUAL_STYLE = "Quiet Cinematic Animation"
 DEFAULT_IMAGE_QUALITY = "Draft"
 DEFAULT_MOTION_LEVEL = "Still"
+DEFAULT_VIDEO_MODE = "basic_motion"
 DEFAULT_NARRATION_ENABLED = True
 DEFAULT_LANGUAGE = "English"
 DEFAULT_VOICE = "Warm Female"
@@ -31,6 +33,34 @@ ASPECT_RATIO_OPTIONS = {
     "Landscape 16:9": ("16:9", 1920, 1080),
     "Square 1:1": ("1:1", 1080, 1080),
 }
+CONTENT_TYPE_LABELS = {
+    "nursery": "Nursery",
+    "simple_life": "Simple Life",
+    "humor": "Humor",
+    "psychology": "Psychology",
+    "philosophy": "Philosophy",
+    "human_behavior": "Human Behavior",
+    "spiritual_reflection": "Spiritual Reflection",
+    "education": "Educational",
+    "story": "Story",
+    "explainer": "Explainer",
+}
+CONTENT_TYPE_OPTIONS = list(CONTENT_TYPE_LABELS.keys())
+CONTENT_TYPE_DISPLAY_OPTIONS = [CONTENT_TYPE_LABELS[key] for key in CONTENT_TYPE_OPTIONS]
+CONTENT_TYPE_LABEL_TO_VALUE = {label: value for value, label in CONTENT_TYPE_LABELS.items()}
+VISUAL_STYLE_OPTIONS = [
+    "Quiet Cinematic Animation",
+    "Animated Realism",
+    "Hand-Painted Storybook",
+    "Minimal Illustration",
+    "Soft 3D Animation",
+    "3D Nursery Animation",
+]
+LEGACY_VISUAL_STYLE_ALIASES = {
+    "Simple Life Story": "Quiet Cinematic Animation",
+    "Soft Watercolor": "Hand-Painted Storybook",
+    "Storybook Illustration": "Hand-Painted Storybook",
+}
 
 
 @dataclass
@@ -39,6 +69,7 @@ class VideoSettings:
     preferred_scene_duration_seconds: int
     scene_durations: list[int]
     scene_count: int
+    video_mode: str
     frame_rate: int
     aspect_ratio: str
     output_width: int
@@ -75,6 +106,33 @@ class VideoPlan:
     settings: VideoSettings
 
 
+def normalize_content_type(content_type: str) -> str:
+    cleaned = (content_type or "").strip()
+    if not cleaned:
+        return "nursery"
+    lowered = cleaned.lower()
+    lowered = lowered.replace("-", "_").replace(" ", "_")
+    if lowered in CONTENT_TYPE_OPTIONS:
+        return lowered
+    if cleaned in CONTENT_TYPE_LABEL_TO_VALUE:
+        return CONTENT_TYPE_LABEL_TO_VALUE[cleaned]
+    for value, label in CONTENT_TYPE_LABELS.items():
+        if lowered == label.lower().replace(" ", "_"):
+            return value
+    return "nursery"
+
+
+def normalize_visual_style(visual_style: str, content_type: str) -> str:
+    cleaned = (visual_style or "").strip()
+    if cleaned in LEGACY_VISUAL_STYLE_ALIASES:
+        return LEGACY_VISUAL_STYLE_ALIASES[cleaned]
+    if cleaned in VISUAL_STYLE_OPTIONS:
+        return cleaned
+    if normalize_content_type(content_type) == "nursery":
+        return "3D Nursery Animation"
+    return DEFAULT_VISUAL_STYLE
+
+
 def build_scene_durations(total_duration_seconds: int, preferred_scene_duration_seconds: int) -> list[int]:
     if total_duration_seconds <= 0:
         raise ValueError("Total duration must be positive.")
@@ -98,6 +156,7 @@ def build_scene_durations(total_duration_seconds: int, preferred_scene_duration_
 def build_video_settings(
     total_duration_seconds: int = DEFAULT_TOTAL_DURATION_SECONDS,
     preferred_scene_duration_seconds: int = DEFAULT_SCENE_DURATION_SECONDS,
+    video_mode: str = DEFAULT_VIDEO_MODE,
     frame_rate: int = DEFAULT_FRAME_RATE,
     aspect_ratio_label: str = DEFAULT_ASPECT_RATIO_LABEL,
     content_type: str = "nursery",
@@ -121,6 +180,9 @@ def build_video_settings(
     if normalized_frame_rate not in FRAME_RATE_OPTIONS:
         normalized_frame_rate = DEFAULT_FRAME_RATE
 
+    normalized_content_type = normalize_content_type(content_type)
+    normalized_visual_style = normalize_visual_style(visual_style, normalized_content_type)
+
     aspect_ratio, output_width, output_height = ASPECT_RATIO_OPTIONS.get(
         aspect_ratio_label,
         ASPECT_RATIO_OPTIONS[DEFAULT_ASPECT_RATIO_LABEL],
@@ -136,12 +198,13 @@ def build_video_settings(
         preferred_scene_duration_seconds=normalized_scene_duration,
         scene_durations=scene_durations,
         scene_count=len(scene_durations),
+        video_mode=video_mode.strip() or DEFAULT_VIDEO_MODE,
         frame_rate=normalized_frame_rate,
         aspect_ratio=aspect_ratio,
         output_width=output_width,
         output_height=output_height,
-        content_type=content_type.strip() or "nursery",
-        visual_style=visual_style.strip() or DEFAULT_VISUAL_STYLE,
+        content_type=normalized_content_type,
+        visual_style=normalized_visual_style,
         image_quality=image_quality.strip() or DEFAULT_IMAGE_QUALITY,
         motion_level=motion_level.strip() or DEFAULT_MOTION_LEVEL,
         narration_enabled=bool(narration_enabled),
@@ -175,26 +238,22 @@ def normalize_json_text(raw_text: str) -> str:
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end != -1 and end > start:
-        return text[start:end + 1]
+        return text[start : end + 1]
 
     return text
 
 
 def parse_plan_json(raw_text: str) -> dict[str, Any]:
-    normalized = normalize_json_text(raw_text)
-    return json.loads(normalized)
+    return json.loads(normalize_json_text(raw_text))
 
 
 def apply_style_lock_to_visual(style_lock: str, visual_prompt: str) -> str:
     style_lock_clean = style_lock.strip()
     visual_clean = visual_prompt.strip()
-
     if not style_lock_clean:
         return visual_clean
-
     if style_lock_clean.lower() in visual_clean.lower():
         return visual_clean
-
     return f"{style_lock_clean}. {visual_clean}"
 
 
@@ -222,7 +281,6 @@ def validate_video_plan_data(plan_data: dict[str, Any], settings: VideoSettings)
         "style_lock",
         "scenes",
     ]
-
     missing_fields = [field for field in required_fields if field not in plan_data]
     if missing_fields:
         raise ValueError(f"Missing required video plan fields: {', '.join(missing_fields)}")
@@ -230,13 +288,11 @@ def validate_video_plan_data(plan_data: dict[str, Any], settings: VideoSettings)
     raw_scenes = plan_data["scenes"]
     if not isinstance(raw_scenes, list):
         raise ValueError("Video plan scenes must be a list.")
-
     if len(raw_scenes) != settings.scene_count:
         raise ValueError(f"Video plan must contain exactly {settings.scene_count} scenes.")
 
     scenes: list[VideoScene] = []
     style_lock = str(plan_data["style_lock"]).strip()
-
     for index, scene_data in enumerate(raw_scenes, start=1):
         if not isinstance(scene_data, dict):
             raise ValueError(f"Scene {index} must be an object.")
@@ -246,7 +302,6 @@ def validate_video_plan_data(plan_data: dict[str, Any], settings: VideoSettings)
         narration = str(scene_data.get("narration", "")).strip()
         visual_prompt = str(scene_data.get("visual_prompt", "")).strip()
         motion_prompt = str(scene_data.get("motion_prompt", "")).strip()
-
         expected_duration = settings.scene_durations[index - 1]
 
         if scene_number != index:
@@ -276,7 +331,7 @@ def validate_video_plan_data(plan_data: dict[str, Any], settings: VideoSettings)
 
     plan = VideoPlan(
         title=str(plan_data["title"]).strip(),
-        content_type=str(plan_data["content_type"]).strip(),
+        content_type=normalize_content_type(str(plan_data["content_type"]).strip()),
         duration_seconds=int(plan_data["duration_seconds"]),
         aspect_ratio=str(plan_data["aspect_ratio"]).strip(),
         narration=str(plan_data["narration"]).strip(),
@@ -301,29 +356,35 @@ def validate_video_plan_data(plan_data: dict[str, Any], settings: VideoSettings)
     return plan
 
 
+def build_fallback_style_lock(idea: str, settings: VideoSettings) -> str:
+    base = (
+        f"{settings.visual_style}, preserve one recurring protagonist identity, "
+        "stable face, hair, clothing, proportions, accessories, palette, environment, and lighting."
+    )
+    if settings.content_type == "nursery":
+        return f"{base} Child-safe warmth and playful clarity based on: {idea}"
+    return f"{base} Match the requested tone and world based on: {idea}"
+
+
 def build_fallback_plan(idea: str, settings: VideoSettings) -> VideoPlan:
-    cleaned_idea = " ".join(idea.split()).strip() or "A playful nursery story"
+    cleaned_idea = " ".join(idea.split()).strip() or "A simple visual story"
     title_base = cleaned_idea[:60].strip().rstrip(".")
     title = title_base.title() if title_base else "Storyboard MVP"
-    style_lock = (
-        f"{settings.visual_style}, warm lighting, child-safe tone, soft textures, "
-        f"one recurring protagonist with fixed face, hairstyle, hair length, hair color, "
-        f"body proportions, eye shape, clothing, color palette, and world design based on: {cleaned_idea}"
-    )
+    style_lock = build_fallback_style_lock(cleaned_idea, settings)
 
     scenes: list[VideoScene] = []
     for index, duration_seconds in enumerate(settings.scene_durations, start=1):
         if index == 1:
-            narration = f"Scene {index} introduces the story idea: {cleaned_idea}."
-            visual_prompt = "Opening frame with the main character in a bright, welcoming setting."
+            narration = f"Scene {index} opens the central idea: {cleaned_idea}."
+            visual_prompt = "Opening frame that establishes the protagonist, setting, and emotional tone."
         elif index == settings.scene_count:
-            narration = f"Scene {index} resolves the story with a gentle, happy ending."
-            visual_prompt = "Closing frame with the character succeeding and smiling in the same world."
+            narration = f"Scene {index} lands the final turn and leaves a clear closing image."
+            visual_prompt = "Closing frame that resolves the central idea while preserving the same world and character."
         else:
-            narration = f"Scene {index} develops the action with one clear learning moment."
-            visual_prompt = "Middle frame showing the key action and a colorful learning beat."
+            narration = f"Scene {index} develops the contradiction or progression in one concise beat."
+            visual_prompt = "Middle frame showing the next visual beat, with continuity from the earlier scene."
 
-        motion_prompt = "Centered subtle zoom for a calm still-image animation."
+        motion_prompt = "Subtle cinematic camera movement that fits a still-image animation workflow."
         scenes.append(
             VideoScene(
                 scene_number=index,
@@ -346,7 +407,7 @@ def build_fallback_plan(idea: str, settings: VideoSettings) -> VideoPlan:
     )
 
 
-def build_planning_prompt(idea: str, settings: VideoSettings) -> str:
+def build_planning_prompt(idea: str, settings: VideoSettings, creative_brief: str = "") -> str:
     scene_examples = ",\n".join(
         (
             "    {\n"
@@ -359,17 +420,17 @@ def build_planning_prompt(idea: str, settings: VideoSettings) -> str:
         )
         for index, duration_seconds in enumerate(settings.scene_durations, start=1)
     )
-
     narration_target = narration_word_target(settings)
-    narration_guidance = ""
     if narration_target is not None:
-        narration_guidance = (
-            f"- Keep the full narration around {narration_target[0]} to {narration_target[1]} words.\n"
-        )
+        narration_guidance = f"- Keep the full narration around {narration_target[0]} to {narration_target[1]} words.\n"
     else:
         narration_guidance = (
             f"- Keep the narration natural for {settings.language} and short enough to finish about 0.5 seconds before the video ends.\n"
         )
+
+    creative_section = ""
+    if creative_brief.strip():
+        creative_section = f"\nCreative intelligence brief:\n{creative_brief.strip()}\n"
 
     return f"""
 You are a video storyboard planner for a Streamlit app.
@@ -395,25 +456,24 @@ Rules:
 - Aspect ratio must be {settings.aspect_ratio}.
 - Content type must be {settings.content_type}.
 - Visual style should align with: {settings.visual_style}.
-- The same protagonist and same world must appear across every scene.
-- The style_lock must describe the recurring protagonist precisely enough to regenerate the same character consistently.
-- The style_lock must explicitly lock hairstyle, hair length, hair color, face shape, body proportions, clothing, palette, species, accessories, and lighting.
-- Keep face, hairstyle, hair length, hair color, body proportions, clothing, palette, species, accessories, and lighting continuity stable across all scenes.
+- The same protagonist and same world must appear across every scene when the concept needs a protagonist.
+- The style_lock must describe the recurring protagonist or recurring world precisely enough to preserve continuity.
+- The style_lock must explicitly lock hairstyle, hair length, hair color, face shape, body proportions, clothing, palette, species if relevant, accessories, and lighting.
+- Keep continuity stable across all scenes.
 - Do not change hair length or hairstyle between scenes unless the user explicitly requests a transformation.
 - Narration enabled: {"yes" if settings.narration_enabled else "no"}.
 - Language: {settings.language}.
 - Speaking style: {settings.speaking_style}.
-{narration_guidance}- Keep the tone safe and suitable for children when applicable.
-- Reuse one strong style_lock across all scenes.
+{narration_guidance}- Use visual storytelling where possible.
 - Do not add markdown fences.
 - Do not add explanatory text.
-
+{creative_section}
 Video idea: {idea}
 """
 
 
-def request_video_plan_from_ollama(idea: str, settings: VideoSettings) -> str:
-    prompt = build_planning_prompt(idea=idea, settings=settings)
+def request_video_plan_from_ollama(idea: str, settings: VideoSettings, creative_brief: str = "") -> str:
+    prompt = build_planning_prompt(idea=idea, settings=settings, creative_brief=creative_brief)
     response = ollama.chat(
         model=OLLAMA_MODEL,
         messages=[
@@ -448,6 +508,37 @@ def shorten_narration_once(narration: str, settings: VideoSettings, available_du
     return response["message"]["content"].strip()
 
 
+def build_creative_brief(result: CreativeResult) -> str:
+    sections = [
+        f"Director intent: {result.director.content_intent}",
+        f"Director tone: {result.director.emotional_tone}",
+        f"Narrative shape: {result.director.narrative_shape}",
+        f"Story focus: {result.director.story_focus}",
+        f"Selected specialists: {', '.join(result.selected_specialists)}",
+        f"Final premise: {result.final_story.premise}",
+        f"Conflict: {result.final_story.conflict}",
+        f"Progression: {result.final_story.progression}",
+        f"Emotional turn: {result.final_story.emotional_turn}",
+        f"Ending: {result.final_story.ending}",
+        "Scene beats:",
+    ]
+    sections.extend(f"- {beat}" for beat in result.final_story.scene_beats)
+    if result.psychology:
+        sections.append(f"Psychology contradiction: {result.psychology.contradiction}")
+    if result.philosophy:
+        sections.append(f"Philosophical question: {result.philosophy.central_question}")
+        sections.append(f"Source meaning: {result.philosophy.source_meaning}")
+        sections.append(f"Modern reflection: {result.philosophy.modern_reflection}")
+    if result.ambiguity:
+        sections.append(f"Ambiguity to preserve: {result.ambiguity.what_not_to_explain}")
+    if result.humor:
+        sections.append(f"Humor setup: {result.humor.setup}")
+        sections.extend(f"- humor candidate: {candidate}" for candidate in result.humor.punchline_candidates)
+    sections.append(f"Critic notes: {result.critic.notes}")
+    sections.extend(f"- critic edit: {instruction}" for instruction in result.critic.edit_instructions)
+    return "\n".join(sections)
+
+
 def build_video_plan(idea: str, settings: VideoSettings) -> tuple[VideoPlan, str | None]:
     try:
         raw_response = request_video_plan_from_ollama(idea=idea, settings=settings)
@@ -456,3 +547,26 @@ def build_video_plan(idea: str, settings: VideoSettings) -> tuple[VideoPlan, str
     except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
         fallback_plan = build_fallback_plan(idea=idea, settings=settings)
         return fallback_plan, f"Ollama returned an invalid plan. Using fallback storyboard. Details: {error}"
+
+
+def build_video_plan_from_creative_result(
+    idea: str,
+    creative_result: CreativeResult,
+    settings: VideoSettings,
+) -> tuple[VideoPlan, str | None]:
+    creative_brief = build_creative_brief(creative_result)
+    try:
+        raw_response = request_video_plan_from_ollama(
+            idea=idea,
+            settings=settings,
+            creative_brief=creative_brief,
+        )
+        plan_data = parse_plan_json(raw_response)
+        return validate_video_plan_data(plan_data, settings=settings), None
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+        fallback_plan = build_fallback_plan(idea=idea, settings=settings)
+        fallback_plan.content_type = settings.content_type
+        return fallback_plan, (
+            "Creative pipeline succeeded, but final storyboard JSON was invalid. "
+            f"Using fallback storyboard. Details: {error}"
+        )

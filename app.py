@@ -4,32 +4,69 @@ import json
 import re
 import pandas as pd
 import sqlite3
+import uuid
 
 from dataclasses import asdict
 from datetime import datetime
 from ddgs import DDGS
+from pathlib import Path
 from pypdf import PdfReader
 from typing import TypedDict, List, Dict, Callable
 from langgraph.graph import StateGraph, START, END
+from kling_assisted import (
+    BASIC_MOTION_MODE,
+    KLING_ASSISTED_MODE,
+    KLING_DURATION_TOLERANCE_SECONDS,
+    STATUS_INVALID,
+    STATUS_NOT_UPLOADED,
+    STATUS_READY,
+    STATUS_UPLOADED,
+    STATUS_VALID,
+    assemble_kling_video,
+    build_import_state_path,
+    build_kling_package,
+    build_kling_prompt,
+    create_import_entry,
+    expected_kling_filename,
+    load_import_state,
+    match_scene_number_from_filename,
+    needs_renormalization,
+    normalize_clip,
+    resolve_narration_path,
+    save_import_state,
+    store_uploaded_clip,
+    update_entry_from_validation,
+    validate_clip,
+)
+from creative_agent import run_creative_pipeline
+from creative_memory import init_creative_memory_db, save_creative_feedback, save_creative_preference
+from creative_models import CreativeRequest
 from video_agent import (
+    CONTENT_TYPE_DISPLAY_OPTIONS,
+    CONTENT_TYPE_LABEL_TO_VALUE,
     DEFAULT_ASPECT_RATIO_LABEL,
     DEFAULT_FRAME_RATE,
     DEFAULT_IMAGE_QUALITY,
     DEFAULT_LANGUAGE,
     DEFAULT_MOTION_LEVEL,
     DEFAULT_NARRATION_ENABLED,
+    DEFAULT_VIDEO_MODE,
     DEFAULT_SPEAKING_SPEED,
     DEFAULT_SPEAKING_STYLE,
     DEFAULT_TOTAL_DURATION_SECONDS,
     DEFAULT_SCENE_DURATION_SECONDS,
     DEFAULT_VISUAL_STYLE,
     DEFAULT_VOICE,
+    VISUAL_STYLE_OPTIONS,
     VideoPlan,
     build_video_plan,
+    build_video_plan_from_creative_result,
     build_video_settings,
+    normalize_content_type,
     settings_snapshot,
 )
-from video_providers import generate_narration_audio, generate_scene_images
+from video_providers import build_scene_image_path, generate_narration_audio, generate_scene_images, measure_wav_duration
+from video_providers import inspect_narration_audio_file, load_app_config, select_speech_provider
 from video_renderer import build_generation_output_dir, ensure_ffmpeg_available, render_video
 
 
@@ -797,6 +834,195 @@ def video_creator_node(state: AumState):
     }
 
 
+def reset_kling_session_state():
+    st.session_state.kling_import_entries = {}
+    st.session_state.kling_unmatched_files = {}
+    st.session_state.kling_package_path = ""
+
+
+def ensure_kling_state_loaded():
+    output_dir_value = st.session_state.video_output_dir
+    if not output_dir_value:
+        return
+
+    output_dir = Path(output_dir_value)
+    state_path = build_import_state_path(output_dir)
+    if not state_path.exists():
+        return
+
+    loaded_entries = load_import_state(output_dir)
+    current_entries = st.session_state.kling_import_entries
+    if not current_entries or set(current_entries.keys()) != set(loaded_entries.keys()):
+        st.session_state.kling_import_entries = loaded_entries
+
+
+def sync_trim_state(plan: VideoPlan):
+    entries = st.session_state.kling_import_entries
+    changed = False
+    for scene in plan.scenes:
+        key = f"kling_trim_start_{scene.scene_number}"
+        if key not in st.session_state:
+            continue
+        entry = entries.get(scene.scene_number)
+        if entry is None:
+            continue
+        trim_value = float(st.session_state[key])
+        if abs(entry.trim_start - trim_value) > 1e-9:
+            entry.trim_start = trim_value
+            entry.normalized_output_path = ""
+            entry.validation_status = STATUS_UPLOADED
+            entry.error_summary = ""
+            entry.updated_timestamp = datetime.now().isoformat()
+            changed = True
+
+    if changed and st.session_state.video_output_dir:
+        save_import_state(
+            output_dir=Path(st.session_state.video_output_dir),
+            generation_id=Path(st.session_state.video_output_dir).name,
+            entries=entries,
+        )
+
+
+def import_kling_uploaded_files(uploaded_files, plan: VideoPlan, output_dir: Path):
+    entries = st.session_state.kling_import_entries
+    unmatched = st.session_state.kling_unmatched_files
+    scene_numbers = {scene.scene_number for scene in plan.scenes}
+    messages = []
+    seen_scene_numbers = set()
+    duplicate_filenames = []
+
+    for uploaded_file in uploaded_files:
+        mapped_scene = match_scene_number_from_filename(uploaded_file.name)
+        if mapped_scene is None or mapped_scene not in scene_numbers:
+            unmatched[uploaded_file.name] = {"path": "", "filename": uploaded_file.name}
+            unmatched_path = output_dir / "kling_imports" / f"unmatched_{Path(uploaded_file.name).name}"
+            unmatched_path.parent.mkdir(parents=True, exist_ok=True)
+            unmatched_path.write_bytes(uploaded_file.getvalue())
+            unmatched[uploaded_file.name]["path"] = str(unmatched_path)
+            messages.append(f"Unmatched file: {uploaded_file.name}")
+            continue
+
+        if mapped_scene in seen_scene_numbers:
+            duplicate_filenames.append(uploaded_file.name)
+            continue
+
+        seen_scene_numbers.add(mapped_scene)
+        scene = next(scene for scene in plan.scenes if scene.scene_number == mapped_scene)
+        stored_path = store_uploaded_clip(
+            output_dir=output_dir,
+            scene_number=mapped_scene,
+            source_filename=uploaded_file.name,
+            file_bytes=uploaded_file.getvalue(),
+        )
+        entry = create_import_entry(
+            generation_id=output_dir.name,
+            scene_number=mapped_scene,
+            source_filename=uploaded_file.name,
+            stored_source_path=stored_path,
+            required_duration=scene.duration_seconds,
+            trim_start=entries.get(mapped_scene).trim_start if mapped_scene in entries else 0.0,
+        )
+        status, details, error_summary = validate_clip(
+            clip_path=stored_path,
+            required_duration=scene.duration_seconds,
+            trim_start=entry.trim_start,
+        )
+        entries[mapped_scene] = update_entry_from_validation(
+            entry=entry,
+            source_path=stored_path,
+            status=status,
+            details=details,
+            error_summary=error_summary,
+        )
+        messages.append(f"Imported {uploaded_file.name} for Scene {mapped_scene}. Status: {status}.")
+
+    for filename in duplicate_filenames:
+        messages.append(f"Duplicate scene assignment prevented for uploaded file: {filename}")
+
+    save_import_state(output_dir=output_dir, generation_id=output_dir.name, entries=entries)
+    st.session_state.kling_import_entries = entries
+    st.session_state.kling_unmatched_files = unmatched
+    return messages
+
+
+def assign_unmatched_file_to_scene(filename: str, scene_number: int, plan: VideoPlan, output_dir: Path):
+    unmatched = st.session_state.kling_unmatched_files
+    entries = st.session_state.kling_import_entries
+    item = unmatched.get(filename)
+    if item is None:
+        raise ValueError(f"Unmatched file not found: {filename}")
+
+    source_path = Path(item["path"])
+    if not source_path.exists():
+        raise FileNotFoundError(f"Stored unmatched file is missing: {source_path}")
+
+    scene = next(scene for scene in plan.scenes if scene.scene_number == scene_number)
+    stored_path = store_uploaded_clip(
+        output_dir=output_dir,
+        scene_number=scene_number,
+        source_filename=filename,
+        file_bytes=source_path.read_bytes(),
+    )
+    entry = create_import_entry(
+        generation_id=output_dir.name,
+        scene_number=scene_number,
+        source_filename=filename,
+        stored_source_path=stored_path,
+        required_duration=scene.duration_seconds,
+        trim_start=entries.get(scene_number).trim_start if scene_number in entries else 0.0,
+    )
+    status, details, error_summary = validate_clip(
+        clip_path=stored_path,
+        required_duration=scene.duration_seconds,
+        trim_start=entry.trim_start,
+    )
+    entries[scene_number] = update_entry_from_validation(
+        entry=entry,
+        source_path=stored_path,
+        status=status,
+        details=details,
+        error_summary=error_summary,
+    )
+    source_path.unlink(missing_ok=True)
+    unmatched.pop(filename, None)
+    save_import_state(output_dir=output_dir, generation_id=output_dir.name, entries=entries)
+    st.session_state.kling_import_entries = entries
+    st.session_state.kling_unmatched_files = unmatched
+
+
+def get_narration_status(output_dir: Path, settings) -> dict[str, str | bool | Path | None]:
+    provider = select_speech_provider(settings=settings)
+    stored_path = Path(st.session_state.video_audio_path) if st.session_state.video_audio_path else None
+    resolved_path = resolve_narration_path(output_dir=output_dir, stored_narration_path=stored_path)
+    status = {
+        "provider_name": provider.provider_name,
+        "model_name": provider.model_name,
+        "narration_enabled": settings.narration_enabled,
+        "path": resolved_path,
+        "file_found": bool(resolved_path and resolved_path.exists()),
+        "duration_text": "N/A",
+        "contains_audible_audio": False,
+        "error": "",
+    }
+
+    if resolved_path is None or not resolved_path.exists():
+        return status
+
+    try:
+        narration_info = inspect_narration_audio_file(
+            audio_path=resolved_path,
+            provider_name=provider.provider_name,
+            model_name=provider.model_name,
+            require_audible_audio=False,
+        )
+        status["duration_text"] = f"{narration_info.duration_seconds:.2f} seconds"
+        status["contains_audible_audio"] = narration_info.contains_audible_audio
+    except Exception as error:
+        status["error"] = str(error)
+
+    return status
+
+
 # -----------------------------
 # Tool Registry
 # Comes from: Python dictionary
@@ -1213,7 +1439,9 @@ st.set_page_config(page_title="AUM State", page_icon="ॐ")
 st.title("AUM State")
 st.caption("AI for clarity, work, and wisdom")
 
+load_app_config()
 init_memory_db()
+init_creative_memory_db()
 
 if "messages" not in st.session_state:
     st.session_state.messages = load_messages_from_db(limit=30)
@@ -1259,6 +1487,27 @@ if "video_quality_label" not in st.session_state:
 
 if "video_settings_snapshot" not in st.session_state:
     st.session_state.video_settings_snapshot = ""
+
+if "video_mode_choice" not in st.session_state:
+    st.session_state.video_mode_choice = "Standard"
+
+if "creative_result" not in st.session_state:
+    st.session_state.creative_result = None
+
+if "creative_summary" not in st.session_state:
+    st.session_state.creative_summary = {}
+
+if "creative_project_id" not in st.session_state:
+    st.session_state.creative_project_id = ""
+
+if "kling_import_entries" not in st.session_state:
+    st.session_state.kling_import_entries = {}
+
+if "kling_unmatched_files" not in st.session_state:
+    st.session_state.kling_unmatched_files = {}
+
+if "kling_package_path" not in st.session_state:
+    st.session_state.kling_package_path = ""
 
 
 st.sidebar.header("Tools")
@@ -1385,6 +1634,16 @@ st.divider()
 
 st.subheader("Video Studio")
 st.caption("Standalone storyboard and rendering workflow. Chat routing remains unchanged.")
+st.markdown("**Creative Intelligence**")
+
+creative_mode = st.selectbox(
+    "Mode",
+    options=["Standard", "Multi-Mind"],
+    index=["Standard", "Multi-Mind"].index(st.session_state.video_mode_choice)
+    if st.session_state.video_mode_choice in ["Standard", "Multi-Mind"]
+    else 0,
+    key="video_mode_choice",
+)
 
 video_idea = st.text_area(
     "Video idea",
@@ -1416,13 +1675,27 @@ with row1_col3:
 
 row2_col1, row2_col2, row2_col3 = st.columns(3)
 with row2_col1:
+    video_mode_label = st.selectbox(
+        "Video generation mode",
+        options=["Basic Motion", "Kling Assisted"],
+        index=["Basic Motion", "Kling Assisted"].index("Basic Motion"),
+        key="video_mode_label",
+    )
+    if video_mode_label == "Basic Motion":
+        st.caption("Create a complete video locally using the current FFmpeg image-animation workflow.")
+    else:
+        st.caption("Generate images and motion prompts in AumState, animate them manually on the Kling website, then upload the clips for final assembly.")
+with row2_col2:
+    content_type_index = CONTENT_TYPE_DISPLAY_OPTIONS.index("Nursery")
+    if st.session_state.get("video_content_type_input") in CONTENT_TYPE_DISPLAY_OPTIONS:
+        content_type_index = CONTENT_TYPE_DISPLAY_OPTIONS.index(st.session_state["video_content_type_input"])
     video_content_type = st.selectbox(
         "Content type",
-        options=["nursery", "education", "story", "explainer"],
-        index=0,
+        options=CONTENT_TYPE_DISPLAY_OPTIONS,
+        index=content_type_index,
         key="video_content_type_input"
     )
-with row2_col2:
+with row2_col3:
     video_quality = st.selectbox(
         "Image quality",
         options=["Draft", "Standard", "Final"],
@@ -1431,11 +1704,13 @@ with row2_col2:
         else 0,
         key="video_quality_label"
     )
-with row2_col3:
+
+row3_col1, row3_col2, row3_col3 = st.columns(3)
+with row3_col1:
     visual_style = st.selectbox(
         "Visual style",
-        options=["3D Nursery Animation", "Soft Watercolor", "Storybook Illustration"],
-        index=["3D Nursery Animation", "Soft Watercolor", "Storybook Illustration"].index(DEFAULT_VISUAL_STYLE),
+        options=VISUAL_STYLE_OPTIONS,
+        index=VISUAL_STYLE_OPTIONS.index(DEFAULT_VISUAL_STYLE),
         key="visual_style_label",
     )
 
@@ -1443,22 +1718,23 @@ st.caption("Draft: cheapest, best for testing")
 st.caption("Standard: balanced quality and cost")
 st.caption("Final: highest quality, use only for approved videos")
 
-row3_col1, row3_col2, row3_col3 = st.columns(3)
-with row3_col1:
+with row3_col2:
     format_label = st.selectbox(
         "Format",
         options=["Vertical 9:16", "Landscape 16:9", "Square 1:1"],
         index=["Vertical 9:16", "Landscape 16:9", "Square 1:1"].index(DEFAULT_ASPECT_RATIO_LABEL),
         key="format_label",
     )
-with row3_col2:
+with row3_col3:
     motion_label = st.selectbox(
         "Motion",
         options=["Still", "Gentle"],
         index=["Still", "Gentle"].index(DEFAULT_MOTION_LEVEL),
         key="motion_label",
     )
-with row3_col3:
+
+row4_col1, row4_col2, row4_col3 = st.columns(3)
+with row4_col1:
     narration_enabled = st.selectbox(
         "Narration",
         options=["On", "Off"],
@@ -1472,29 +1748,29 @@ speaking_style = DEFAULT_SPEAKING_STYLE
 speaking_speed = DEFAULT_SPEAKING_SPEED
 
 if narration_enabled == "On":
-    row4_col1, row4_col2, row4_col3, row4_col4 = st.columns(4)
-    with row4_col1:
+    row5_col1, row5_col2, row5_col3, row5_col4 = st.columns(4)
+    with row5_col1:
         language = st.selectbox(
             "Language",
             options=["English", "Hindi", "Telugu"],
             index=["English", "Hindi", "Telugu"].index(DEFAULT_LANGUAGE),
             key="language_label",
         )
-    with row4_col2:
+    with row5_col2:
         voice = st.selectbox(
             "Voice",
             options=["Warm Female", "Warm Male", "Neutral"],
             index=["Warm Female", "Warm Male", "Neutral"].index(DEFAULT_VOICE),
             key="voice_label",
         )
-    with row4_col3:
+    with row5_col3:
         speaking_style = st.selectbox(
             "Speaking style",
             options=["Warm", "Playful", "Calm"],
             index=["Warm", "Playful", "Calm"].index(DEFAULT_SPEAKING_STYLE),
             key="speaking_style_label",
         )
-    with row4_col4:
+    with row5_col4:
         speaking_speed = st.selectbox(
             "Speaking speed",
             options=["Slow", "Normal", "Fast"],
@@ -1505,9 +1781,10 @@ if narration_enabled == "On":
 current_video_settings = build_video_settings(
     total_duration_seconds=int(video_duration_label.split()[0]),
     preferred_scene_duration_seconds=int(scene_duration_label.split()[0]),
+    video_mode=BASIC_MOTION_MODE if video_mode_label == "Basic Motion" else KLING_ASSISTED_MODE,
     frame_rate=int(frame_rate_label.split()[0]),
     aspect_ratio_label=format_label,
-    content_type=video_content_type,
+    content_type=CONTENT_TYPE_LABEL_TO_VALUE.get(video_content_type, normalize_content_type(video_content_type)),
     visual_style=visual_style,
     image_quality=video_quality,
     motion_level=motion_label,
@@ -1517,6 +1794,19 @@ current_video_settings = build_video_settings(
     speaking_style=speaking_style,
     speaking_speed=speaking_speed,
 )
+
+if creative_mode == "Multi-Mind":
+    creative_col1, creative_col2, creative_col3 = st.columns(3)
+    with creative_col1:
+        humor_setting = st.selectbox("Humor", options=["Off", "Gentle", "Strong"], index=0, key="creative_humor_level")
+    with creative_col2:
+        depth_setting = st.selectbox("Depth", options=["Light", "Medium", "Deep"], index=1, key="creative_depth_level")
+    with creative_col3:
+        ambiguity_setting = st.selectbox("Ambiguity", options=["Clear", "Balanced", "Open-ended"], index=1, key="creative_ambiguity_level")
+else:
+    humor_setting = "Off"
+    depth_setting = "Medium"
+    ambiguity_setting = "Balanced"
 
 storyboard_stale = (
     bool(st.session_state.video_plan)
@@ -1531,6 +1821,7 @@ st.caption(
     "Scene timing: "
     + ", ".join(f"{duration}s" for duration in current_video_settings.scene_durations)
 )
+st.caption(f"Mode: {video_mode_label}")
 st.caption(f"Frame rate: {current_video_settings.frame_rate} FPS")
 st.caption(
     f"Format: {format_label.split()[0]} {current_video_settings.output_width}x{current_video_settings.output_height}"
@@ -1550,17 +1841,56 @@ with video_col1:
     storyboard_clicked = st.button("Create storyboard")
 
 with video_col2:
-    generate_video_clicked = st.button("Generate assets and video")
+    generate_video_clicked = st.button("Generate assets and video") if current_video_settings.video_mode == BASIC_MOTION_MODE else False
 
 if storyboard_clicked:
     if not video_idea.strip():
         st.warning("Enter a video idea before creating a storyboard.")
     else:
-        with st.spinner("Creating storyboard..."):
-            video_plan, video_warning = build_video_plan(
-                idea=video_idea,
-                settings=current_video_settings
-            )
+        progress_box = st.empty()
+        creative_result = None
+        video_warning = ""
+
+        def creative_progress(message: str):
+            progress_box.info(message)
+
+        save_creative_preference("preferred_humor_style", humor_setting.lower())
+        save_creative_preference("preferred_visual_style", visual_style)
+        save_creative_preference("preferred_ending_style", depth_setting.lower())
+        save_creative_preference("avoid_preachy", "true" if depth_setting != "Deep" else "false")
+        save_creative_preference("preferred_topics", current_video_settings.content_type)
+
+        try:
+            if creative_mode == "Multi-Mind":
+                creative_request = CreativeRequest(
+                    idea=video_idea,
+                    content_type=current_video_settings.content_type,
+                    tone="reflective" if depth_setting == "Deep" else "balanced",
+                    target_audience="general",
+                    language=current_video_settings.language,
+                    duration_seconds=current_video_settings.total_duration_seconds,
+                    visual_style=current_video_settings.visual_style,
+                    humor_level=humor_setting.lower(),
+                    depth_level=depth_setting.lower(),
+                    ambiguity_level=ambiguity_setting.lower(),
+                )
+                creative_result = run_creative_pipeline(
+                    request=creative_request,
+                    progress_callback=creative_progress,
+                )
+                progress_box.info("Generating storyboard from creative synthesis")
+                video_plan, video_warning = build_video_plan_from_creative_result(
+                    idea=video_idea,
+                    creative_result=creative_result,
+                    settings=current_video_settings,
+                )
+            else:
+                progress_box.info("Creating storyboard")
+                video_plan, video_warning = build_video_plan(
+                    idea=video_idea,
+                    settings=current_video_settings
+                )
+
             st.session_state.video_plan = video_plan
             st.session_state.video_plan_warning = video_warning or ""
             st.session_state.video_settings_snapshot = settings_snapshot(current_video_settings)
@@ -1569,6 +1899,22 @@ if storyboard_clicked:
             st.session_state.video_audio_path = ""
             st.session_state.video_file_path = ""
             st.session_state.video_status_messages = []
+            st.session_state.creative_result = creative_result
+            st.session_state.creative_summary = creative_result.creative_summary if creative_result else {}
+            st.session_state.creative_project_id = f"video_{uuid.uuid4().hex[:10]}"
+            if creative_result:
+                save_creative_feedback(
+                    project_id=st.session_state.creative_project_id,
+                    relatability=creative_result.critic.relatability_score,
+                    humor=creative_result.critic.humor_score,
+                    depth=creative_result.critic.philosophical_depth_score,
+                    preachiness=creative_result.critic.preachiness_score,
+                    notes=creative_result.critic.notes,
+                )
+            reset_kling_session_state()
+            progress_box.success("Storyboard ready.")
+        except Exception as error:
+            progress_box.error(f"Storyboard creation failed: {error}")
 
 if st.session_state.video_plan_warning:
     st.info(st.session_state.video_plan_warning)
@@ -1578,6 +1924,33 @@ if storyboard_stale:
 
 if st.session_state.video_plan:
     current_video_plan = st.session_state.video_plan
+    ensure_kling_state_loaded()
+    if creative_mode == "Multi-Mind" and st.session_state.creative_result:
+        creative_result = st.session_state.creative_result
+        st.markdown("**Story Concept**")
+        st.write(creative_result.final_story.premise)
+        st.caption(f"Conflict: {creative_result.final_story.conflict}")
+        st.caption(f"Ending: {creative_result.final_story.ending}")
+        with st.expander("Creative reasoning summary"):
+            st.write(f"Selected specialists: {', '.join(creative_result.selected_specialists)}")
+            if creative_result.psychology:
+                st.write(f"Psychological contradiction: {creative_result.psychology.contradiction}")
+            if creative_result.philosophy:
+                st.write(f"Philosophical question: {creative_result.philosophy.central_question}")
+            if creative_result.humor:
+                st.write(f"Humor direction: {creative_result.humor.humor_style}")
+            if creative_result.ambiguity:
+                st.write(f"Ambiguity note: {creative_result.ambiguity.unresolved_question}")
+            critic = creative_result.critic
+            st.write(
+                "Critic scores: "
+                f"relatability={critic.relatability_score}, clarity={critic.clarity_score}, "
+                f"humor={critic.humor_score}, psychological_truth={critic.psychological_truth_score}, "
+                f"philosophical_depth={critic.philosophical_depth_score}, ambiguity={critic.ambiguity_score}, "
+                f"originality={critic.originality_score}, preachiness={critic.preachiness_score}"
+            )
+            for warning in creative_result.warnings:
+                st.warning(warning)
     st.markdown(f"**Title:** {current_video_plan.title}")
     st.markdown(f"**Narration:** {current_video_plan.narration}")
     st.markdown(f"**Style Lock:** {current_video_plan.style_lock}")
@@ -1635,6 +2008,306 @@ if generate_video_clicked:
             progress_box.success("Video generation complete.")
         except Exception as e:
             progress_box.error(f"Video generation failed: {e}")
+
+if current_video_settings.video_mode == KLING_ASSISTED_MODE:
+    st.markdown("**Kling Assisted Workflow**")
+    st.caption("Duration tolerance for imported clips: 0.15 seconds. Clips shorter than required duration minus 0.15 seconds are rejected.")
+    generation_settings = st.session_state.video_plan.settings if st.session_state.video_plan else current_video_settings
+    narration_status = (
+        get_narration_status(Path(st.session_state.video_output_dir), generation_settings)
+        if st.session_state.video_output_dir
+        else {
+            "provider_name": select_speech_provider(settings=generation_settings).provider_name if st.session_state.video_plan else "",
+            "model_name": select_speech_provider(settings=generation_settings).model_name if st.session_state.video_plan else "",
+            "narration_enabled": generation_settings.narration_enabled,
+            "path": None,
+            "file_found": False,
+            "duration_text": "N/A",
+            "contains_audible_audio": False,
+            "error": "",
+        }
+    )
+
+    kling_stage_col1, kling_stage_col2, kling_stage_col3 = st.columns(3)
+    with kling_stage_col1:
+        generate_kling_assets_clicked = st.button("Generate scene images and narration")
+    with kling_stage_col2:
+        export_kling_package_clicked = st.button("Export Kling Package")
+    with kling_stage_col3:
+        regenerate_narration_clicked = st.button("Regenerate narration only")
+
+    if generate_kling_assets_clicked:
+        if not st.session_state.video_plan:
+            st.warning("Create a storyboard before generating assets.")
+        elif storyboard_stale:
+            st.warning("Settings changed. Create a new storyboard before generating assets.")
+        else:
+            progress_box = st.empty()
+            try:
+                progress_box.info("Checking FFmpeg...")
+                ensure_ffmpeg_available()
+                output_dir = Path(st.session_state.video_output_dir) if st.session_state.video_output_dir else build_generation_output_dir()
+                st.session_state.video_output_dir = str(output_dir)
+                progress_box.info("Generating scene images...")
+                image_paths, image_messages = generate_scene_images(
+                    plan=st.session_state.video_plan,
+                    output_dir=output_dir,
+                    settings=current_video_settings,
+                )
+                progress_box.info("Generating narration audio...")
+                audio_path, audio_message = generate_narration_audio(
+                    plan=st.session_state.video_plan,
+                    output_dir=output_dir,
+                    settings=current_video_settings,
+                )
+                st.session_state.video_image_paths = [str(path) for path in image_paths]
+                st.session_state.video_audio_path = str(audio_path) if audio_path else ""
+                st.session_state.video_status_messages = image_messages + [audio_message]
+                progress_box.success("Scene images and narration are ready for Kling export.")
+            except Exception as e:
+                progress_box.error(f"Kling asset generation failed: {e}")
+
+    if export_kling_package_clicked:
+        if not st.session_state.video_plan:
+            st.warning("Create a storyboard before exporting a Kling package.")
+        elif storyboard_stale:
+            st.warning("Settings changed. Create a new storyboard before exporting a Kling package.")
+        elif not st.session_state.video_output_dir:
+            st.warning("Generate scene images and narration before exporting a Kling package.")
+        else:
+            try:
+                output_dir = Path(st.session_state.video_output_dir)
+                package_path = build_kling_package(
+                    plan=st.session_state.video_plan,
+                    settings=current_video_settings,
+                    output_dir=output_dir,
+                    generation_id=output_dir.name,
+                )
+                st.session_state.kling_package_path = str(package_path)
+                st.success(f"Created Kling package: {package_path.name}")
+            except Exception as e:
+                st.error(f"Kling package export failed: {e}")
+
+    if regenerate_narration_clicked:
+        if not st.session_state.video_plan:
+            st.warning("Create a storyboard before regenerating narration.")
+        elif not st.session_state.video_output_dir:
+            st.warning("Generate scene images and narration before regenerating narration only.")
+        else:
+            progress_box = st.empty()
+            try:
+                output_dir = Path(st.session_state.video_output_dir)
+                progress_box.info("Generating narration audio...")
+                audio_path, audio_message = generate_narration_audio(
+                    plan=st.session_state.video_plan,
+                    output_dir=output_dir,
+                    settings=generation_settings,
+                )
+                st.session_state.video_audio_path = str(audio_path) if audio_path else ""
+                st.session_state.video_status_messages.append(audio_message)
+                progress_box.success("Narration regeneration complete.")
+            except Exception as e:
+                progress_box.error(f"Narration regeneration failed: {e}")
+
+    if st.session_state.video_plan and st.session_state.video_image_paths:
+        st.markdown("**Stage 3: Review Kling prompts**")
+        use_expanders = len(st.session_state.video_plan.scenes) > 3
+        sync_trim_state(st.session_state.video_plan)
+        for scene in st.session_state.video_plan.scenes:
+            entry = st.session_state.kling_import_entries.get(scene.scene_number)
+            status_value = entry.validation_status if entry is not None else STATUS_NOT_UPLOADED
+            container = st.expander(f"Scene {scene.scene_number}", expanded=not use_expanders) if use_expanders else st.container(border=True)
+            with container:
+                st.markdown(f"**Scene {scene.scene_number}**")
+                image_path = build_scene_image_path(Path(st.session_state.video_output_dir), scene.scene_number)
+                if image_path.exists():
+                    st.image(str(image_path), caption=f"Scene {scene.scene_number}", use_container_width=True)
+                st.caption(f"Duration: {scene.duration_seconds} seconds")
+                st.caption(f"Imported clip status: {status_value}")
+                st.write(scene.narration)
+                prompt_text = build_kling_prompt(scene=scene, settings=current_video_settings)
+                st.text_area(
+                    f"Kling motion prompt for Scene {scene.scene_number}",
+                    value=prompt_text,
+                    height=320,
+                    key=f"kling_prompt_{scene.scene_number}",
+                )
+                if entry is not None and entry.stored_source_path and Path(entry.stored_source_path).exists():
+                    st.video(entry.stored_source_path)
+                    source_duration = entry.source_duration or 0.0
+                    st.caption(f"Source duration: {source_duration:.2f} seconds")
+                    st.caption(f"Required duration: {entry.required_duration:.2f} seconds")
+                    if source_duration > entry.required_duration + KLING_DURATION_TOLERANCE_SECONDS:
+                        st.caption("Trimming will occur during normalization.")
+                    st.number_input(
+                        "Clip start position",
+                        min_value=0.0,
+                        value=float(entry.trim_start),
+                        step=0.1,
+                        key=f"kling_trim_start_{scene.scene_number}",
+                    )
+                    if entry.error_summary:
+                        st.warning(entry.error_summary)
+
+    if st.session_state.kling_package_path and Path(st.session_state.kling_package_path).exists():
+        with open(st.session_state.kling_package_path, "rb") as package_file:
+            st.download_button(
+                label="Download Kling Package ZIP",
+                data=package_file,
+                file_name=Path(st.session_state.kling_package_path).name,
+                mime="application/zip",
+            )
+
+    if st.session_state.video_plan and st.session_state.video_output_dir:
+        st.markdown("**Stage 5: Upload Kling clips**")
+        uploaded_kling_files = st.file_uploader(
+            "Upload Kling MP4 clips",
+            type=["mp4"],
+            accept_multiple_files=True,
+            key="kling_clip_uploader",
+        )
+        import_kling_clips_clicked = st.button("Import uploaded Kling clips")
+        if import_kling_clips_clicked:
+            if not uploaded_kling_files:
+                st.warning("No Kling clips uploaded.")
+            else:
+                messages = import_kling_uploaded_files(
+                    uploaded_files=uploaded_kling_files,
+                    plan=st.session_state.video_plan,
+                    output_dir=Path(st.session_state.video_output_dir),
+                )
+                st.session_state.video_status_messages.extend(messages)
+
+        if st.session_state.kling_unmatched_files:
+            st.markdown("**Unmatched files**")
+            for filename in list(st.session_state.kling_unmatched_files.keys()):
+                target_scene = st.selectbox(
+                    f"Assign {filename} to scene",
+                    options=[scene.scene_number for scene in st.session_state.video_plan.scenes],
+                    key=f"assign_scene_{filename}",
+                )
+                replace_key = f"replace_scene_{filename}"
+                existing_entry = st.session_state.kling_import_entries.get(target_scene)
+                if existing_entry is not None:
+                    st.checkbox(
+                        f"Replace existing Scene {target_scene} clip for {filename}",
+                        value=False,
+                        key=replace_key,
+                    )
+                assign_clicked = st.button(f"Assign {filename}", key=f"assign_button_{filename}")
+                if assign_clicked:
+                    if existing_entry is not None and not st.session_state.get(replace_key, False):
+                        st.warning(f"Scene {target_scene} already has an assigned clip. Confirm replacement to continue.")
+                    else:
+                        try:
+                            assign_unmatched_file_to_scene(
+                                filename=filename,
+                                scene_number=int(target_scene),
+                                plan=st.session_state.video_plan,
+                                output_dir=Path(st.session_state.video_output_dir),
+                            )
+                            st.success(f"Assigned {filename} to Scene {target_scene}.")
+                        except Exception as e:
+                            st.error(f"Assignment failed for {filename}: {e}")
+
+    if st.session_state.video_plan and st.session_state.video_output_dir:
+        st.markdown("**Stage 6: Validate and assemble final video**")
+        narration_status = get_narration_status(Path(st.session_state.video_output_dir), generation_settings)
+        st.caption(f"Narration provider: {narration_status['provider_name']}")
+        st.caption(f"Narration model: {narration_status['model_name']}")
+        st.caption(f"Narration enabled: {'Yes' if generation_settings.narration_enabled else 'No'}")
+        st.caption(f"Narration file found: {'Yes' if narration_status['file_found'] else 'No'}")
+        narration_path = narration_status["path"]
+        st.caption(f"Narration file path: {narration_path if narration_path else 'None'}")
+        st.caption(f"Narration filename: {narration_path.name if narration_path else 'None'}")
+        st.caption(f"Narration duration: {narration_status['duration_text']}")
+        st.caption(f"Audible audio: {'Yes' if narration_status['contains_audible_audio'] else 'No'}")
+        if narration_status["error"]:
+            st.warning(str(narration_status["error"]))
+        validate_and_assemble_clicked = st.button("Validate and assemble final video")
+        reattach_narration_clicked = st.button("Reattach narration only")
+        if validate_and_assemble_clicked:
+            if not st.session_state.kling_import_entries:
+                st.warning("No clips uploaded.")
+            elif generation_settings.narration_enabled and (
+                not narration_status["file_found"] or not narration_status["contains_audible_audio"]
+            ):
+                st.error("Narration is enabled, but no valid audible narration file was found. Regenerate narration before assembling.")
+            else:
+                progress_box = st.empty()
+                try:
+                    ensure_ffmpeg_available()
+                    output_dir = Path(st.session_state.video_output_dir)
+                    entries = st.session_state.kling_import_entries
+                    for scene in st.session_state.video_plan.scenes:
+                        entry = entries.get(scene.scene_number)
+                        if entry is None:
+                            continue
+                        progress_box.info(f"Validating Scene {scene.scene_number}...")
+                        source_path = Path(entry.stored_source_path)
+                        status, details, error_summary = validate_clip(
+                            clip_path=source_path,
+                            required_duration=scene.duration_seconds,
+                            trim_start=entry.trim_start,
+                        )
+                        entries[scene.scene_number] = update_entry_from_validation(
+                            entry=entry,
+                            source_path=source_path,
+                            status=status,
+                            details=details,
+                            error_summary=error_summary,
+                        )
+                        if status in {STATUS_VALID, STATUS_READY}:
+                            if needs_renormalization(entries[scene.scene_number], source_path):
+                                progress_box.info(f"Normalizing Scene {scene.scene_number}...")
+                                normalized_path = normalize_clip(
+                                    source_path=source_path,
+                                    output_dir=output_dir,
+                                    scene_number=scene.scene_number,
+                                    settings=generation_settings,
+                                    required_duration=scene.duration_seconds,
+                                    trim_start=entry.trim_start,
+                                )
+                                entries[scene.scene_number].normalized_output_path = str(normalized_path)
+                            entries[scene.scene_number].validation_status = STATUS_READY
+
+                    save_import_state(output_dir=output_dir, generation_id=output_dir.name, entries=entries)
+                    st.session_state.kling_import_entries = entries
+                    progress_box.info("Assembling final video...")
+                    video_path = assemble_kling_video(
+                        plan=st.session_state.video_plan,
+                        settings=generation_settings,
+                        output_dir=output_dir,
+                        import_entries=entries,
+                        narration_path=narration_status["path"],
+                    )
+                    st.session_state.video_file_path = str(video_path)
+                    st.session_state.video_status_messages.append(f"Rendered Kling assisted video: {video_path.name}")
+                    progress_box.success("Kling assisted video generation complete.")
+                except Exception as e:
+                    progress_box.error(f"Kling assisted assembly failed: {e}")
+        if reattach_narration_clicked:
+            if generation_settings.narration_enabled and (
+                not narration_status["file_found"] or not narration_status["contains_audible_audio"]
+            ):
+                st.error("Narration is enabled, but no valid audible narration file was found. Regenerate narration before assembling.")
+            else:
+                progress_box = st.empty()
+                try:
+                    progress_box.info("Reattaching narration to existing Kling project...")
+                    output_dir = Path(st.session_state.video_output_dir)
+                    video_path = assemble_kling_video(
+                        plan=st.session_state.video_plan,
+                        settings=generation_settings,
+                        output_dir=output_dir,
+                        import_entries=st.session_state.kling_import_entries,
+                        narration_path=narration_status["path"],
+                    )
+                    st.session_state.video_file_path = str(video_path)
+                    st.session_state.video_status_messages.append(f"Reattached narration: {video_path.name}")
+                    progress_box.success("Narration reattachment complete.")
+                except Exception as e:
+                    progress_box.error(f"Narration reattachment failed: {e}")
 
 if st.session_state.video_status_messages:
     st.markdown("**Video generation status**")

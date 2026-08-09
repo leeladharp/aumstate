@@ -5,6 +5,8 @@ import io
 import json
 import logging
 import os
+import re
+import subprocess
 import textwrap
 import urllib.error
 import urllib.request
@@ -13,14 +15,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 
 from video_agent import VideoPlan, VideoScene, VideoSettings, shorten_narration_once
+from video_renderer import ensure_ffmpeg_available, ensure_ffprobe_available, run_subprocess
 
 
 OPENAI_IMAGE_MODEL = "gpt-image-1"
 DEV_MODE_ENV = "VIDEO_DEV_MODE"
 OPENAI_API_KEY_ENV = "OPENAI_API_KEY"
+OPENAI_TTS_MODEL_ENV = "OPENAI_TTS_MODEL"
+DEFAULT_OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
+AUDIBLE_AUDIO_THRESHOLD_DB = -60.0
 QUALITY_DRAFT = "Draft"
 QUALITY_STANDARD = "Standard"
 QUALITY_FINAL = "Final"
@@ -36,6 +43,32 @@ ASPECT_RATIO_TO_OPENAI_SIZE = {
     "1:1": "1024x1024",
 }
 logger = logging.getLogger(__name__)
+_CONFIG_LOADED = False
+
+VOICE_LABEL_TO_OPENAI = {
+    "Warm Female": "coral",
+    "Warm Male": "ash",
+    "Neutral": "alloy",
+}
+SPEAKING_SPEED_TO_OPENAI = {
+    "Slow": 0.9,
+    "Normal": 1.0,
+    "Fast": 1.1,
+}
+
+
+@dataclass
+class NarrationAudioInfo:
+    path: Path
+    exists: bool
+    file_size_bytes: int
+    duration_seconds: float
+    has_audio_stream: bool
+    contains_audible_audio: bool
+    codec_name: str
+    provider_name: str
+    model_name: str
+    max_volume_db: float | None = None
 
 
 @dataclass
@@ -53,6 +86,29 @@ class ImageProvider(Protocol):
 class SpeechProvider(Protocol):
     def generate_narration_audio(self, narration: str, output_path: Path) -> ProviderResult:
         ...
+
+    @property
+    def provider_name(self) -> str:
+        ...
+
+    @property
+    def model_name(self) -> str:
+        ...
+
+    @property
+    def requires_audible_audio(self) -> bool:
+        ...
+
+
+def load_app_config(force: bool = False, dotenv_path: Path | None = None) -> None:
+    global _CONFIG_LOADED
+    if _CONFIG_LOADED and not force and dotenv_path is None:
+        return
+    load_dotenv(dotenv_path=dotenv_path, override=False)
+    _CONFIG_LOADED = True
+
+
+load_app_config()
 
 
 def ensure_directory(path: Path) -> None:
@@ -141,7 +197,33 @@ def create_silent_wav(output_path: Path, duration_seconds: float) -> Path:
 
 
 def is_video_dev_mode() -> bool:
-    return os.getenv(DEV_MODE_ENV, "").strip().lower() == "true"
+    return get_config_value(DEV_MODE_ENV, "false").strip().lower() == "true"
+
+
+def get_streamlit_secret(key: str) -> str:
+    try:
+        import streamlit as st
+    except Exception:
+        return ""
+
+    try:
+        value = st.secrets.get(key, "")
+    except Exception:
+        return ""
+
+    return str(value).strip()
+
+
+def get_config_value(key: str, default: str = "") -> str:
+    value = os.getenv(key, "").strip()
+    if value:
+        return value
+
+    secret_value = get_streamlit_secret(key)
+    if secret_value:
+        return secret_value
+
+    return default
 
 
 def get_openai_image_size(settings: VideoSettings) -> str:
@@ -151,15 +233,13 @@ def get_openai_image_size(settings: VideoSettings) -> str:
 def build_openai_image_prompt(plan: VideoPlan, scene: VideoScene) -> str:
     return (
         "Shared continuity instructions:\n"
-        "- Preserve the exact same main character design across all scenes.\n"
-        "- Treat the reference character design as authoritative for every later scene.\n"
-        "- Preserve clothing, face, proportions, colors, environment style, and lighting.\n"
-        "- Preserve the exact same hairstyle, hair length, hairline, hair volume, and hair color across all scenes.\n"
-        "- Do not restyle, lengthen, shorten, braid, curl, straighten, recolor, or otherwise alter the hair unless the user explicitly requested that transformation.\n"
-        "- Create a polished 3D nursery animation aesthetic.\n"
-        "- Use large expressive eyes, soft rounded shapes, bright pastel colors, warm cinematic lighting, and toddler-friendly composition.\n"
+        "- Preserve exact recurring character identity across all scenes when a recurring character is present.\n"
+        "- Treat the first approved image or reference character design as authoritative for every later scene.\n"
+        "- Preserve face, hair, clothing, body proportions, accessories, environment continuity, and lighting continuity.\n"
+        "- Preserve the exact same hairstyle, hair length, hairline, hair volume, and hair color across all scenes unless the user explicitly requested a change.\n"
+        "- Preserve the requested style_lock without adding extra aesthetics that were not requested.\n"
         "- No text, logos, watermarks, captions, extra limbs, duplicate characters, or distorted anatomy.\n"
-        "- Vertical composition suitable for a 9:16 short-form video.\n\n"
+        f"- Respect the selected aspect ratio: {plan.aspect_ratio}.\n\n"
         f"Style lock:\n{plan.style_lock}\n\n"
         f"Scene instructions:\n{scene.visual_prompt}\n\n"
         "Scene metadata:\n"
@@ -167,17 +247,20 @@ def build_openai_image_prompt(plan: VideoPlan, scene: VideoScene) -> str:
         f"- Duration: {scene.duration_seconds} seconds\n"
         f"- Motion intent for later animation: {scene.motion_prompt}\n\n"
         "Image requirements:\n"
-        "- Vertical 9:16 composition.\n"
-        "- Use the closest supported OpenAI image size for portrait output.\n"
+        "- Use the closest supported OpenAI image size for the selected aspect ratio.\n"
         "- Save the final image as PNG.\n"
         "- Do not stretch the generated image.\n"
         "- If a reference image is provided, keep the same hair and face identity as the reference image.\n"
-        "- If the API returns a different supported portrait size, preserve aspect ratio and let the existing renderer handle final 1080x1920 video sizing."
+        "- If the API returns a different supported size, preserve aspect ratio and let the existing renderer handle final video sizing."
     )
 
 
 def get_openai_api_key() -> str:
-    return os.getenv(OPENAI_API_KEY_ENV, "").strip()
+    return get_config_value(OPENAI_API_KEY_ENV)
+
+
+def get_openai_tts_model() -> str:
+    return get_config_value(OPENAI_TTS_MODEL_ENV, DEFAULT_OPENAI_TTS_MODEL)
 
 
 def build_openai_client() -> Any:
@@ -227,7 +310,7 @@ class PlaceholderImageProvider:
             narration="",
             style_lock="",
             scenes=[],
-            settings=self.settings or VideoSettings(15, 5, [5, 5, 5], 3, 30, "9:16", 1080, 1920, "nursery", "3D Nursery Animation", "Draft", "Still", True, "English", "Warm Female", "Warm", "Normal"),
+            settings=self.settings or VideoSettings(15, 5, [5, 5, 5], 3, "basic_motion", 30, "9:16", 1080, 1920, "nursery", "3D Nursery Animation", "Draft", "Still", True, "English", "Warm Female", "Warm", "Normal"),
         )
         settings = self.settings or placeholder_plan.settings
         render_placeholder_image(scene=scene, plan=placeholder_plan, output_path=output_path, settings=settings)
@@ -347,6 +430,10 @@ def save_png_bytes(image_bytes: bytes, output_path: Path) -> Path:
 
 
 class SilentSpeechProvider:
+    provider_name = "Development fallback"
+    model_name = "silent_wav"
+    requires_audible_audio = False
+
     def generate_narration_audio(self, narration: str, output_path: Path) -> ProviderResult:
         word_count = max(1, len(narration.split()))
         duration_seconds = max(15.0, word_count / 2.5)
@@ -358,45 +445,159 @@ class SilentSpeechProvider:
         )
 
 
-class EnvSpeechProvider:
-    def __init__(self) -> None:
-        self.api_url = os.getenv("AUMSTATE_SPEECH_API_URL", "").strip()
-        self.api_key = os.getenv("AUMSTATE_SPEECH_API_KEY", "").strip()
+class OpenAISpeechProvider:
+    provider_name = "OpenAI"
+    requires_audible_audio = True
+
+    def __init__(self, settings: VideoSettings, client: Any | None = None) -> None:
+        self.settings = settings
+        self.api_key = get_openai_api_key()
+        self.model_name = get_openai_tts_model()
+        self.client = client
 
     def is_configured(self) -> bool:
-        return bool(self.api_url and self.api_key)
+        return bool(self.api_key)
+
+    def build_voice(self) -> str:
+        return VOICE_LABEL_TO_OPENAI.get(self.settings.voice, "alloy")
+
+    def build_instructions(self) -> str:
+        return (
+            f"Language: {self.settings.language}. "
+            f"Speaking style: {self.settings.speaking_style}. "
+            f"Voice tone: {self.settings.voice}. "
+            "Deliver clear, natural narration with stable pacing."
+        )
+
+    def build_speed(self) -> float:
+        return SPEAKING_SPEED_TO_OPENAI.get(self.settings.speaking_speed, 1.0)
 
     def generate_narration_audio(self, narration: str, output_path: Path) -> ProviderResult:
         if not self.is_configured():
-            raise ValueError(
-                "Speech generation credentials are missing. Set AUMSTATE_SPEECH_API_URL and "
-                "AUMSTATE_SPEECH_API_KEY or use the silent audio fallback."
-            )
+            raise ValueError("OPENAI_API_KEY is missing. Configure it before generating real narration.")
 
-        payload = json.dumps({"text": narration}).encode("utf-8")
-        request = urllib.request.Request(
-            self.api_url,
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-            },
-            method="POST",
+        client = self.client or build_openai_client()
+        response = client.audio.speech.create(
+            input=narration,
+            model=self.model_name,
+            voice=self.build_voice(),
+            instructions=self.build_instructions(),
+            response_format="wav",
+            speed=self.build_speed(),
         )
 
-        try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                audio_bytes = response.read()
-        except urllib.error.URLError as error:
-            raise RuntimeError(f"Speech generation request failed: {error}") from error
-
         ensure_directory(output_path)
-        output_path.write_bytes(audio_bytes)
+        response.write_to_file(output_path)
         return ProviderResult(
             path=output_path,
             used_fallback=False,
-            message="Generated narration audio using the configured API provider.",
+            message=f"Generated narration audio with OpenAI using model {self.model_name}.",
         )
+
+
+def select_speech_provider(
+    settings: VideoSettings,
+    speech_provider: SpeechProvider | None = None,
+) -> SpeechProvider:
+    if speech_provider is not None:
+        return speech_provider
+    if is_video_dev_mode():
+        return SilentSpeechProvider()
+    return OpenAISpeechProvider(settings=settings)
+
+
+def probe_audio_file(audio_path: Path) -> dict[str, Any]:
+    ensure_ffprobe_available()
+    result = run_subprocess(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_streams",
+            "-show_format",
+            "-of",
+            "json",
+            str(audio_path),
+        ]
+    )
+    return json.loads(result.stdout)
+
+
+def get_audio_max_volume_db(audio_path: Path) -> float | None:
+    ensure_ffmpeg_available()
+    process = subprocess.run(
+        [
+            "ffmpeg",
+            "-i",
+            str(audio_path),
+            "-af",
+            "volumedetect",
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = process.stderr
+    match = re.search(r"max_volume:\s*([-\w\.]+)\s*dB", output)
+    if match is None:
+        raise RuntimeError("Could not determine narration audio loudness.")
+    raw_value = match.group(1).lower()
+    if raw_value == "-inf":
+        return None
+    return float(raw_value)
+
+
+def audio_contains_audible_signal(audio_path: Path) -> bool:
+    max_volume_db = get_audio_max_volume_db(audio_path)
+    if max_volume_db is None:
+        return False
+    return max_volume_db > AUDIBLE_AUDIO_THRESHOLD_DB
+
+
+def inspect_narration_audio_file(
+    audio_path: Path,
+    provider_name: str = "",
+    model_name: str = "",
+    require_audible_audio: bool = True,
+) -> NarrationAudioInfo:
+    if not audio_path.exists():
+        raise FileNotFoundError(f"Narration file was not created: {audio_path}")
+
+    file_size_bytes = audio_path.stat().st_size
+    if file_size_bytes <= 0:
+        raise ValueError(f"Narration file is empty: {audio_path}")
+
+    payload = probe_audio_file(audio_path)
+    streams = payload.get("streams", [])
+    audio_stream = next((stream for stream in streams if stream.get("codec_type") == "audio"), None)
+    if audio_stream is None:
+        raise ValueError(f"Narration file does not contain a readable audio stream: {audio_path}")
+
+    duration_value = payload.get("format", {}).get("duration", 0.0) or 0.0
+    duration_seconds = float(duration_value)
+    if duration_seconds <= 0:
+        raise ValueError(f"Narration file duration is invalid: {audio_path}")
+
+    max_volume_db = get_audio_max_volume_db(audio_path)
+    contains_audible_audio = max_volume_db is not None and max_volume_db > AUDIBLE_AUDIO_THRESHOLD_DB
+    if require_audible_audio and not contains_audible_audio:
+        raise ValueError("Narration was generated, but the audio is silent or invalid. Please retry narration generation.")
+
+    return NarrationAudioInfo(
+        path=audio_path,
+        exists=True,
+        file_size_bytes=file_size_bytes,
+        duration_seconds=duration_seconds,
+        has_audio_stream=True,
+        contains_audible_audio=contains_audible_audio,
+        codec_name=str(audio_stream.get("codec_name", "") or ""),
+        provider_name=provider_name,
+        model_name=model_name,
+        max_volume_db=max_volume_db,
+    )
 
 
 def generate_scene_images(
@@ -455,20 +656,25 @@ def generate_narration_audio(
     if not settings.narration_enabled:
         return None, "Narration disabled."
 
-    provider = speech_provider or EnvSpeechProvider()
+    provider = select_speech_provider(settings=settings, speech_provider=speech_provider)
     output_path = build_narration_audio_path(output_dir=output_dir)
     available_duration_seconds = max(0.5, settings.total_duration_seconds - 0.5)
 
-    try:
-        result = provider.generate_narration_audio(plan.narration, output_path)
-    except Exception as error:
-        result = SilentSpeechProvider().generate_narration_audio(plan.narration, output_path)
-        return result.path, f"Speech generation unavailable. Using silent fallback audio. Details: {error}"
+    result = provider.generate_narration_audio(plan.narration, output_path)
 
     try:
-        narration_duration = measure_wav_duration(result.path)
-    except Exception as error:
-        return result.path, f"{result.message} Audio duration could not be measured. Details: {error}"
+        narration_info = inspect_narration_audio_file(
+            audio_path=result.path,
+            provider_name=provider.provider_name,
+            model_name=provider.model_name,
+            require_audible_audio=provider.requires_audible_audio,
+        )
+    except ValueError as error:
+        if provider.requires_audible_audio:
+            raise ValueError("Narration was generated, but the audio is silent or invalid. Please retry narration generation.") from error
+        raise
+
+    narration_duration = narration_info.duration_seconds
 
     if narration_duration <= available_duration_seconds:
         return result.path, result.message
@@ -481,7 +687,18 @@ def generate_narration_audio(
 
     retry_path = output_dir / "narration_retry.wav"
     retry_result = provider.generate_narration_audio(shortened_narration, retry_path)
-    retry_duration = measure_wav_duration(retry_result.path)
+    try:
+        retry_info = inspect_narration_audio_file(
+            audio_path=retry_result.path,
+            provider_name=provider.provider_name,
+            model_name=provider.model_name,
+            require_audible_audio=provider.requires_audible_audio,
+        )
+    except ValueError as error:
+        if provider.requires_audible_audio:
+            raise ValueError("Narration was generated, but the audio is silent or invalid. Please retry narration generation.") from error
+        raise
+    retry_duration = retry_info.duration_seconds
     if retry_duration > available_duration_seconds:
         return retry_result.path, (
             f"{retry_result.message} Narration still exceeds the available duration after one retry."
