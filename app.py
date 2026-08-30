@@ -1917,7 +1917,10 @@ if storyboard_clicked:
             progress_box.error(f"Storyboard creation failed: {error}")
 
 if st.session_state.video_plan_warning:
-    st.info(st.session_state.video_plan_warning)
+    if "used the generic fallback storyboard" in st.session_state.video_plan_warning.lower():
+        st.warning(st.session_state.video_plan_warning)
+    else:
+        st.info(st.session_state.video_plan_warning)
 
 if storyboard_stale:
     st.warning("Settings changed. Create a new storyboard before generating assets.")
@@ -1962,6 +1965,10 @@ if st.session_state.video_plan:
             st.write(scene.narration)
             st.caption(f"Visual prompt: {scene.visual_prompt}")
             st.caption(f"Motion prompt: {scene.motion_prompt}")
+            st.caption(
+                "Continuity: "
+                f"mode={scene.continuity_mode}, group={scene.continuity_group or 'none'}"
+            )
 
 if generate_video_clicked:
     if not st.session_state.video_plan:

@@ -231,20 +231,39 @@ def get_openai_image_size(settings: VideoSettings) -> str:
 
 
 def build_openai_image_prompt(plan: VideoPlan, scene: VideoScene) -> str:
+    continuity_lines = [
+        "Shared continuity instructions:",
+        "- Preserve the requested style_lock without adding extra aesthetics that were not requested.",
+        "- No text, logos, watermarks, captions, extra limbs, duplicate characters, or distorted anatomy.",
+        f"- Respect the selected aspect ratio: {plan.aspect_ratio}.",
+    ]
+    if scene.continuity_mode == "independent":
+        continuity_lines.extend(
+            [
+                "- This scene is independent. Do not inherit subjects or symbols from earlier scenes unless they are explicitly in this scene prompt.",
+                "- Generate a fresh image for this scene without forcing continuity from earlier scenes.",
+            ]
+        )
+    else:
+        continuity_lines.extend(
+            [
+                f"- This scene uses continuity_mode={scene.continuity_mode} and continuity_group={scene.continuity_group}.",
+                "- Preserve exact recurring character or world identity for this continuity group only.",
+                "- If a reference image is provided, treat that group's approved reference image as authoritative.",
+                "- Preserve face, hair, clothing, body proportions, accessories, environment continuity, and lighting continuity for this continuity group.",
+                "- Preserve the exact same hairstyle, hair length, hairline, hair volume, and hair color unless the user explicitly requested a change.",
+            ]
+        )
     return (
-        "Shared continuity instructions:\n"
-        "- Preserve exact recurring character identity across all scenes when a recurring character is present.\n"
-        "- Treat the first approved image or reference character design as authoritative for every later scene.\n"
-        "- Preserve face, hair, clothing, body proportions, accessories, environment continuity, and lighting continuity.\n"
-        "- Preserve the exact same hairstyle, hair length, hairline, hair volume, and hair color across all scenes unless the user explicitly requested a change.\n"
-        "- Preserve the requested style_lock without adding extra aesthetics that were not requested.\n"
-        "- No text, logos, watermarks, captions, extra limbs, duplicate characters, or distorted anatomy.\n"
-        f"- Respect the selected aspect ratio: {plan.aspect_ratio}.\n\n"
+        "\n".join(continuity_lines)
+        + "\n\n"
         f"Style lock:\n{plan.style_lock}\n\n"
         f"Scene instructions:\n{scene.visual_prompt}\n\n"
         "Scene metadata:\n"
         f"- Scene number: {scene.scene_number}\n"
         f"- Duration: {scene.duration_seconds} seconds\n"
+        f"- Continuity mode: {scene.continuity_mode}\n"
+        f"- Continuity group: {scene.continuity_group or 'none'}\n"
         f"- Motion intent for later animation: {scene.motion_prompt}\n\n"
         "Image requirements:\n"
         "- Use the closest supported OpenAI image size for the selected aspect ratio.\n"
@@ -329,14 +348,14 @@ class OpenAIImageProvider:
         self.quality_label = normalize_quality_label(settings.image_quality)
         self.openai_quality = map_quality_label_to_openai(self.quality_label)
         self.client = client
-        self.continuity_reference_path: Path | None = None
+        self.continuity_references: dict[str, Path] = {}
 
     def is_configured(self) -> bool:
         return bool(self.api_key)
 
-    def update_continuity_reference(self, image_path: Path) -> None:
-        if self.continuity_reference_path is None:
-            self.continuity_reference_path = image_path
+    def update_continuity_reference(self, scene: VideoScene, image_path: Path) -> None:
+        if scene.continuity_group and scene.continuity_mode != "independent":
+            self.continuity_references[scene.continuity_group] = image_path
 
     def _generate_from_reference(
         self,
@@ -344,7 +363,11 @@ class OpenAIImageProvider:
         scene: VideoScene,
         prompt: str,
     ) -> Any:
-        if self.continuity_reference_path is None:
+        reference_path = None
+        if scene.continuity_group and scene.continuity_mode != "independent":
+            reference_path = self.continuity_references.get(scene.continuity_group)
+
+        if reference_path is None:
             return client.images.generate(
                 model=OPENAI_IMAGE_MODEL,
                 prompt=prompt,
@@ -359,9 +382,9 @@ class OpenAIImageProvider:
             get_openai_image_size(self.settings),
             self.openai_quality,
             scene.scene_number,
-            self.continuity_reference_path.name,
+            reference_path.name,
         )
-        with self.continuity_reference_path.open("rb") as reference_image:
+        with reference_path.open("rb") as reference_image:
             return client.images.edit(
                 model=OPENAI_IMAGE_MODEL,
                 image=reference_image,
@@ -395,7 +418,7 @@ class OpenAIImageProvider:
             raise RuntimeError(f"Scene {scene.scene_number} returned an empty image response.")
 
         save_png_bytes(image_bytes=image_bytes, output_path=output_path)
-        self.update_continuity_reference(output_path)
+        self.update_continuity_reference(scene=scene, image_path=output_path)
         return ProviderResult(
             path=output_path,
             used_fallback=False,

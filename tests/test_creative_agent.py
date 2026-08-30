@@ -122,20 +122,39 @@ def build_fake_ollama():
             }
             """
         elif "you are the story writer" in system_prompt:
-            content = """
-            {
-              "premise": "A man tries to look above public opinion while orbiting his own status viewers.",
-              "conflict": "His self-image and his behavior keep colliding.",
-              "progression": "Each refresh turns his claim of indifference into a visual confession.",
-              "emotional_turn": "He notices the contradiction in real time.",
-              "ending": "The final silence lands better than an explanation.",
-              "scene_beats": [
-                "He says he does not care what people think.",
-                "He checks the WhatsApp status viewer list again.",
-                "He catches himself and says nothing."
-              ]
-            }
-            """
+            if "bhagavad gita 3.38" in system_prompt:
+                content = """
+                {
+                  "premise": "Bhagavad Gita 3.38 names three coverings that hide clarity before turning toward modern desire.",
+                  "conflict": "Clarity remains present, but desire keeps obscuring access to it.",
+                  "progression": "Smoke covers fire, dust obscures a mirror, unborn life remains enclosed within the womb, and only then does the scene move toward a modern mind clouded by craving.",
+                  "emotional_turn": "A modern person recognizes that mental restlessness has covered simple clarity.",
+                  "ending": "The disturbance settles and perception quietly clears.",
+                  "scene_beats": [
+                    "Smoke partially covers a fire.",
+                    "Dust obscures a mirror.",
+                    "Unborn life remains enclosed within the womb.",
+                    "A modern person sits in thought as inner clarity begins to feel clouded.",
+                    "Desire and comparison subtly cloud the mind.",
+                    "The disturbance settles and clarity quietly returns."
+                  ]
+                }
+                """
+            else:
+                content = """
+                {
+                  "premise": "A man tries to look above public opinion while orbiting his own status viewers.",
+                  "conflict": "His self-image and his behavior keep colliding.",
+                  "progression": "Each refresh turns his claim of indifference into a visual confession.",
+                  "emotional_turn": "He notices the contradiction in real time.",
+                  "ending": "The final silence lands better than an explanation.",
+                  "scene_beats": [
+                    "He says he does not care what people think.",
+                    "He checks the WhatsApp status viewer list again.",
+                    "He catches himself and says nothing."
+                  ]
+                }
+                """
         elif "final editor and critic" in system_prompt:
             content = """
             {
@@ -158,20 +177,39 @@ def build_fake_ollama():
             """
         elif "revise the story exactly once" in system_prompt:
             revision_calls["count"] += 1
-            content = """
-            {
-              "premise": "A man says he does not care what people think, then keeps checking who viewed his WhatsApp status.",
-              "conflict": "His words protect his pride while his actions betray his need for approval.",
-              "progression": "The refreshes get quicker and harder to excuse.",
-              "emotional_turn": "He sees himself doing it and cannot hide behind the speech anymore.",
-              "ending": "He locks the phone, but not before one last glance.",
-              "scene_beats": [
-                "Public claim of indifference.",
-                "Private ritual of checking.",
-                "Quiet self-recognition."
-              ]
-            }
-            """
+            if "bhagavad gita 3.38" in system_prompt:
+                content = """
+                {
+                  "premise": "Bhagavad Gita 3.38 shows desire as a covering over clarity through three concrete metaphors before turning toward modern restlessness.",
+                  "conflict": "Human clarity is present, yet desire and craving keep veiling it.",
+                  "progression": "Smoke covers fire, dust obscures a mirror, unborn life stays enclosed within the womb, then a modern mind grows clouded by comparison and wanting.",
+                  "emotional_turn": "The person notices the mental noise and begins to let it settle.",
+                  "ending": "Clarity quietly returns without spectacle.",
+                  "scene_beats": [
+                    "Smoke partially covers a fire.",
+                    "Dust obscures a mirror.",
+                    "Unborn life remains enclosed within the womb.",
+                    "A modern person sits in thought as inner clarity begins to feel clouded.",
+                    "Desire and comparison subtly cloud the mind.",
+                    "The disturbance settles and clarity quietly returns."
+                  ]
+                }
+                """
+            else:
+                content = """
+                {
+                  "premise": "A man says he does not care what people think, then keeps checking who viewed his WhatsApp status.",
+                  "conflict": "His words protect his pride while his actions betray his need for approval.",
+                  "progression": "The refreshes get quicker and harder to excuse.",
+                  "emotional_turn": "He sees himself doing it and cannot hide behind the speech anymore.",
+                  "ending": "He locks the phone, but not before one last glance.",
+                  "scene_beats": [
+                    "Public claim of indifference.",
+                    "Private ritual of checking.",
+                    "Quiet self-recognition."
+                  ]
+                }
+                """
         else:
             raise AssertionError(f"Unexpected prompt: {system_prompt}")
 
@@ -213,8 +251,42 @@ class CreativeAgentTests(unittest.TestCase):
         )
         result = run_creative_pipeline(request=request, ollama_chat=fake_ollama)
         self.assertIn("philosophy", result.selected_specialists)
+        self.assertIn("psychology", result.selected_specialists)
+        self.assertIn("ambiguity", result.selected_specialists)
         self.assertNotIn("humor", result.selected_specialists)
         self.assertEqual(result.philosophy.source_meaning.startswith("The verse describes desire"), True)
+
+    def test_verse_based_reflection_activates_required_specialists_and_preserves_metaphors(self) -> None:
+        fake_ollama = build_fake_ollama()
+        request = CreativeRequest(
+            idea=(
+                "Create a quiet animated reflection on Bhagavad Gita 3.38 using smoke covering fire, "
+                "dust covering a mirror, and the womb enclosing unborn life. Use those metaphors to "
+                "explore how desire can obscure human clarity."
+            ),
+            content_type="spiritual_reflection",
+            tone="quiet reflective",
+            target_audience="general",
+            language="English",
+            duration_seconds=30,
+            visual_style="Quiet Cinematic Animation",
+            depth_level="deep",
+        )
+        result = run_creative_pipeline(request=request, ollama_chat=fake_ollama)
+
+        self.assertEqual(
+            result.selected_specialists,
+            ["psychology", "philosophy", "ambiguity", "story", "critic"],
+        )
+        self.assertEqual(
+            result.final_story.scene_beats[:3],
+            [
+                "Smoke partially covers a fire.",
+                "Dust obscures a mirror.",
+                "Unborn life remains enclosed within the womb.",
+            ],
+        )
+        self.assertIn("modern person", result.final_story.scene_beats[3].lower())
 
     def test_director_does_not_select_all_specialists_for_education(self) -> None:
         fake_ollama = build_fake_ollama()

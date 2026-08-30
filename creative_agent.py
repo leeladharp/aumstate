@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import asdict, fields, is_dataclass
 from typing import Any, Callable, TypedDict, get_args, get_origin, get_type_hints
@@ -68,6 +69,108 @@ class CreativeState(TypedDict):
     warnings: list[str]
     execution_log: list[RoleExecution]
     completed_roles: list[str]
+
+
+SOURCE_TEXT_MARKERS = (
+    "bhagavad gita",
+    "verse",
+    "scripture",
+    "sutra",
+    "upanishad",
+    "quran",
+    "bible",
+    "source text",
+)
+REFLECTIVE_CONTENT_TYPES = {"philosophy", "spiritual_reflection"}
+
+
+def extract_explicit_source_metaphors(idea: str) -> list[str]:
+    cleaned = " ".join((idea or "").split()).strip()
+    if not cleaned:
+        return []
+
+    lowered = cleaned.lower()
+    captured = ""
+    using_match = re.search(r"\busing\s+(.+?)(?:\.\s+use\b|$)", cleaned, flags=re.IGNORECASE)
+    if using_match:
+        captured = using_match.group(1).strip(" .")
+    elif "smoke covering fire" in lowered and "dust covering a mirror" in lowered:
+        captured = cleaned
+
+    if not captured:
+        return []
+
+    normalized = captured.replace(", and ", ", ").replace(" and ", ", ")
+    parts = [part.strip(" .") for part in normalized.split(",") if part.strip(" .")]
+    metaphors: list[str] = []
+    for part in parts:
+        lowered_part = part.lower()
+        if "womb" in lowered_part and "unborn" in lowered_part:
+            metaphors.append("unborn life enclosed within the womb")
+        else:
+            metaphors.append(lowered_part)
+    return metaphors
+
+
+def is_source_based_reflective_request(request: CreativeRequest) -> bool:
+    idea_lower = (request.idea or "").lower()
+    content_type = (request.content_type or "").lower()
+    has_source_marker = any(marker in idea_lower for marker in SOURCE_TEXT_MARKERS)
+    has_explicit_metaphors = bool(extract_explicit_source_metaphors(request.idea))
+    is_reflective_type = content_type in REFLECTIVE_CONTENT_TYPES or "reflect" in (request.tone or "").lower()
+    return (has_source_marker or has_explicit_metaphors) and is_reflective_type
+
+
+def build_source_fidelity_guidance(request: CreativeRequest) -> str:
+    if not is_source_based_reflective_request(request):
+        return ""
+
+    metaphors = extract_explicit_source_metaphors(request.idea)
+    lines = [
+        "This is a source-based reflective request.",
+        "Prioritize source fidelity before poetic invention.",
+        "Preserve explicit source metaphors unless the user explicitly requests reinterpretation.",
+        "Present the source imagery first, then move into modern reflection.",
+        "Keep the tone contemplative, but do not replace source meaning with generic spiritual symbolism.",
+    ]
+    if metaphors:
+        lines.append("Explicit source metaphors to preserve in order:")
+        lines.extend(f"- {metaphor}" for metaphor in metaphors)
+        if any("womb" in metaphor and "unborn" in metaphor for metaphor in metaphors):
+            lines.append(
+                "- Present unborn life enclosed within the womb respectfully and symbolically, not medically, "
+                "and do not transform it into jars, seeds, cracks, or other substitute objects."
+            )
+    return "\n".join(lines)
+
+
+def enforce_director_defaults(request: CreativeRequest, decision: DirectorDecision) -> DirectorDecision:
+    if not is_source_based_reflective_request(request):
+        return decision
+
+    story_focus = decision.story_focus.strip()
+    if "preserve source metaphors" not in story_focus.lower():
+        story_focus = (
+            f"{story_focus}. Preserve source metaphors first, then move into modern reflection."
+            if story_focus
+            else "Preserve source metaphors first, then move into modern reflection."
+        )
+
+    return DirectorDecision(
+        content_intent=decision.content_intent,
+        emotional_tone=decision.emotional_tone,
+        narrative_shape=decision.narrative_shape or "source_metaphor_to_modern_reflection",
+        use_psychology=True,
+        use_philosophy=True,
+        use_humor=False,
+        use_ambiguity=True,
+        humor_level="off",
+        philosophy_level=decision.philosophy_level or "deep",
+        psychology_level=decision.psychology_level or "medium",
+        ambiguity_level=decision.ambiguity_level or "balanced",
+        story_focus=story_focus,
+        rationale=decision.rationale,
+    )
 
 
 def dataclass_to_json(instance: Any) -> str:
@@ -192,17 +295,24 @@ def load_model_config() -> CreativeModelConfig:
 
 
 def build_director_prompt(request: CreativeRequest, role_memory: str) -> str:
+    source_guidance = build_source_fidelity_guidance(request)
+    source_section = f"\n\nSource fidelity guidance:\n{source_guidance}" if source_guidance else ""
     return (
         "You are the Creative Director for a short-form video system.\n"
         "Decide which specialist lenses are necessary before storyboard generation.\n"
         "Do not select every specialist unless the idea truly needs them.\n"
         "Humor is optional. Philosophy is optional. Educational content often needs story plus critic only.\n"
+        "For source-based reflective prompts, select philosophy, psychology, ambiguity, story, and critic.\n"
+        "For verse-based or scripture-based reflection, the first pass must prioritize source fidelity over poetic invention.\n"
         f"Relevant memory:\n{role_memory or '- none'}\n\n"
         f"Request:\n{dataclass_to_json(request)}"
+        f"{source_section}"
     )
 
 
 def build_psychology_prompt(state: CreativeState, role_memory: str) -> str:
+    source_guidance = build_source_fidelity_guidance(state["request"])
+    source_section = f"\n\nSource fidelity guidance:\n{source_guidance}" if source_guidance else ""
     return (
         "You analyze ordinary human behavior without diagnosing mental illness.\n"
         "Focus on insecurity, status, self-deception, fear, desire, family dynamics, and contradiction.\n"
@@ -210,10 +320,13 @@ def build_psychology_prompt(state: CreativeState, role_memory: str) -> str:
         f"Relevant memory:\n{role_memory or '- none'}\n\n"
         f"Request:\n{dataclass_to_json(state['request'])}\n\n"
         f"Director:\n{dataclass_to_json(state['director'])}"
+        f"{source_section}"
     )
 
 
 def build_philosophy_prompt(state: CreativeState, role_memory: str) -> str:
+    source_guidance = build_source_fidelity_guidance(state["request"])
+    source_section = f"\n\nSource fidelity guidance:\n{source_guidance}" if source_guidance else ""
     return (
         "You extract philosophical tension without becoming preachy.\n"
         "If the request references a source text, separate source meaning from modern reflection.\n"
@@ -221,6 +334,7 @@ def build_philosophy_prompt(state: CreativeState, role_memory: str) -> str:
         f"Relevant memory:\n{role_memory or '- none'}\n\n"
         f"Request:\n{dataclass_to_json(state['request'])}\n\n"
         f"Director:\n{dataclass_to_json(state['director'])}"
+        f"{source_section}"
     )
 
 
@@ -251,10 +365,17 @@ def build_humor_prompt(state: CreativeState, role_memory: str) -> str:
 
 
 def build_story_prompt(state: CreativeState, role_memory: str) -> str:
+    source_guidance = build_source_fidelity_guidance(state["request"])
+    source_section = f"\n\nSource fidelity guidance:\n{source_guidance}" if source_guidance else ""
     return (
         "You are the story writer. Convert insight into one coherent short-form story.\n"
         "Do not concatenate specialist text. Use action, visual situations, and concise narration.\n"
         "For 15 to 30 seconds, create a strong first beat, one contradiction, one turn, and a concise ending.\n"
+        "Scene beats must be concrete visual events, objects, or actions that can each become a specific shot.\n"
+        "Reject vague beats such as 'introduces the idea', 'develops the story', 'next visual beat', "
+        "'establishes the protagonist', or 'resolves the concept'.\n"
+        "If the request references a verse, source text, or supplied metaphor, preserve its concrete imagery before adding interpretation.\n"
+        "Prefer literal source metaphors over generic spiritual symbols.\n"
         f"Relevant memory:\n{role_memory or '- none'}\n\n"
         f"Request:\n{dataclass_to_json(state['request'])}\n\n"
         f"Director:\n{dataclass_to_json(state['director'])}\n\n"
@@ -262,6 +383,7 @@ def build_story_prompt(state: CreativeState, role_memory: str) -> str:
         f"Philosophy:\n{dataclass_to_json(state['philosophy'])}\n\n"
         f"Ambiguity:\n{dataclass_to_json(state['ambiguity'])}\n\n"
         f"Humor:\n{dataclass_to_json(state['humor'])}"
+        f"{source_section}"
     )
 
 
@@ -278,13 +400,19 @@ def build_critic_prompt(state: CreativeState, role_memory: str) -> str:
 
 
 def build_revision_prompt(state: CreativeState) -> str:
+    source_guidance = build_source_fidelity_guidance(state["request"])
+    source_section = f"\n\nSource fidelity guidance:\n{source_guidance}" if source_guidance else ""
     return (
         "Revise the story exactly once using the critic instructions.\n"
         "Preserve the strongest central idea. Remove preachiness and unnecessary explanation.\n"
-        "Keep the story concise and visual.\n\n"
+        "Keep the story concise and visual.\n"
+        "Every scene beat must remain a concrete visible event, object, or action.\n"
+        "Do not leave generic placeholders like 'next beat' or 'develops the contradiction'.\n"
+        "If the source included explicit metaphors or images, keep them in the revised scene beats.\n\n"
         f"Request:\n{dataclass_to_json(state['request'])}\n\n"
         f"Original story:\n{dataclass_to_json(state['story'])}\n\n"
         f"Critic:\n{dataclass_to_json(state['critic'])}"
+        f"{source_section}"
     )
 
 
@@ -341,6 +469,8 @@ def run_role(
             output_schema=output_schema,
             ollama_chat=ollama_chat,
         )
+        if role == ROLE_DIRECTOR:
+            result = enforce_director_defaults(state["request"], result)
         duration_seconds = time.perf_counter() - started_at
         logger.info("creative role=%s model=%s duration_seconds=%.3f", role, model_name, duration_seconds)
         state[target_key] = result
