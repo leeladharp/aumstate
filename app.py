@@ -1,6 +1,7 @@
 import streamlit as st
 import ollama
 import json
+import logging
 import re
 import pandas as pd
 import sqlite3
@@ -41,6 +42,7 @@ from kling_assisted import (
 from creative_agent import run_creative_pipeline
 from creative_memory import init_creative_memory_db, save_creative_feedback, save_creative_preference
 from creative_models import CreativeRequest
+from error_utils import format_technical_error, format_user_error
 from video_agent import (
     CONTENT_TYPE_DISPLAY_OPTIONS,
     CONTENT_TYPE_LABEL_TO_VALUE,
@@ -66,7 +68,7 @@ from video_agent import (
     settings_snapshot,
 )
 from video_providers import build_scene_image_path, generate_narration_audio, generate_scene_images, measure_wav_duration
-from video_providers import inspect_narration_audio_file, load_app_config, select_speech_provider
+from video_providers import inspect_narration_audio_file, is_video_dev_mode, load_app_config, select_speech_provider
 from video_renderer import build_generation_output_dir, ensure_ffmpeg_available, render_video
 
 
@@ -104,6 +106,11 @@ class AumState(TypedDict):
 # Role: save/load chat history and long-term user facts
 # -----------------------------
 DB_PATH = "aumstate_memory.db"
+logger = logging.getLogger(__name__)
+
+
+def storyboard_failure_stage(error: Exception) -> str:
+    return str(getattr(error, "stage", "")).strip() or "unknown"
 
 
 def init_memory_db():
@@ -1914,7 +1921,20 @@ if storyboard_clicked:
             reset_kling_session_state()
             progress_box.success("Storyboard ready.")
         except Exception as error:
-            progress_box.error(f"Storyboard creation failed: {error}")
+            stage = storyboard_failure_stage(error)
+            formatted_reason = format_user_error(error, "Unknown storyboard error")
+            logger.exception(
+                "storyboard_creation_failed stage=%s generation_mode=%s content_type=%s scene_count=%s multi_mind_enabled=%s",
+                stage,
+                current_video_settings.video_mode,
+                current_video_settings.content_type,
+                current_video_settings.scene_count,
+                creative_mode == "Multi-Mind",
+            )
+            progress_box.error(f"Storyboard creation failed: {formatted_reason}")
+            if is_video_dev_mode():
+                with st.expander("Technical details"):
+                    st.code(format_technical_error(error))
 
 if st.session_state.video_plan_warning:
     if "used the generic fallback storyboard" in st.session_state.video_plan_warning.lower():
