@@ -107,6 +107,15 @@ class AmbiguityInsight:
 
 
 @dataclass
+class NarrativeConstraint:
+    id: str
+    constraint_type: str
+    description: str
+    importance: str = "required"
+    source_order: int | None = None
+
+
+@dataclass
 class StoryDraft:
     premise: str
     conflict: str
@@ -153,6 +162,7 @@ class CreativeResult:
     critic: CreativeEvaluation
     final_story: StoryDraft
     selected_specialists: list[str]
+    narrative_constraints: list[NarrativeConstraint] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     execution_log: list[RoleExecution] = field(default_factory=list)
     creative_summary: dict[str, Any] = field(default_factory=dict)

@@ -210,6 +210,105 @@ def build_fake_ollama():
                   ]
                 }
                 """
+        elif "extract only the narrative requirements" in system_prompt:
+            if "bhagavad gita 3.38" in system_prompt:
+                content = """
+                {
+                  "narrative_constraints": [
+                    {
+                      "id": "constraint_1",
+                      "constraint_type": "source_metaphor",
+                      "description": "smoke covering fire",
+                      "importance": "required",
+                      "source_order": 1
+                    },
+                    {
+                      "id": "constraint_2",
+                      "constraint_type": "source_metaphor",
+                      "description": "dust covering a mirror",
+                      "importance": "required",
+                      "source_order": 2
+                    },
+                    {
+                      "id": "constraint_3",
+                      "constraint_type": "source_metaphor",
+                      "description": "unborn life enclosed within the womb",
+                      "importance": "required",
+                      "source_order": 3
+                    }
+                  ]
+                }
+                """
+            elif "online purchase" in system_prompt or "package" in system_prompt:
+                content = """
+                {
+                  "narrative_constraints": [
+                    {
+                      "id": "constraint_1",
+                      "constraint_type": "plot_event",
+                      "description": "husband hides an online purchase",
+                      "importance": "required",
+                      "source_order": 1
+                    },
+                    {
+                      "id": "constraint_2",
+                      "constraint_type": "plot_event",
+                      "description": "wife finds the package",
+                      "importance": "required",
+                      "source_order": 2
+                    },
+                    {
+                      "id": "constraint_3",
+                      "constraint_type": "plot_event",
+                      "description": "husband pretends it was already in the house",
+                      "importance": "required",
+                      "source_order": 3
+                    }
+                  ]
+                }
+                """
+            elif "evaporation" in system_prompt and "condensation" in system_prompt:
+                content = """
+                {
+                  "narrative_constraints": [
+                    {
+                      "id": "constraint_1",
+                      "constraint_type": "educational_step",
+                      "description": "evaporation",
+                      "importance": "required",
+                      "source_order": 1
+                    },
+                    {
+                      "id": "constraint_2",
+                      "constraint_type": "educational_step",
+                      "description": "condensation",
+                      "importance": "required",
+                      "source_order": 2
+                    },
+                    {
+                      "id": "constraint_3",
+                      "constraint_type": "educational_step",
+                      "description": "rainfall",
+                      "importance": "required",
+                      "source_order": 3
+                    }
+                  ]
+                }
+                """
+            else:
+                content = """
+                {
+                  "narrative_constraints": [
+                    {
+                      "id": "constraint_1",
+                      "constraint_type": "contradiction",
+                      "description": "He performs indifference while chasing approval.",
+                      "importance": "required",
+                      "source_order": null
+                    }
+                  ]
+                }
+                """
         else:
             raise AssertionError(f"Unexpected prompt: {system_prompt}")
 
@@ -360,6 +459,85 @@ class CreativeAgentTests(unittest.TestCase):
         result = run_creative_pipeline(request=request, ollama_chat=fake_ollama)
         self.assertIn("WhatsApp status", result.final_story.premise)
         self.assertEqual(fake_ollama.revision_calls["count"], 1)
+
+    def test_gita_request_produces_only_three_source_constraints(self) -> None:
+        fake_ollama = build_fake_ollama()
+        request = CreativeRequest(
+            idea=(
+                "Create a 30-second quiet cinematic reflection on Bhagavad Gita 3.38.\n\n"
+                "The verse uses three metaphors:\n"
+                "- smoke covering fire\n"
+                "- dust covering a mirror\n"
+                "- unborn life enclosed by the womb\n\n"
+                "Use those metaphors to explore how desire can obscure human clarity.\n\n"
+                "Keep the scriptural meaning separate from the modern psychological interpretation.\n"
+                "Do not force humor.\n"
+                "Keep some ambiguity.\n"
+                "Use quiet cinematic animation with muted earthy colors and restrained movement.\n\n"
+                "Do not force the same character into symbolic scenes.\n"
+                "Decide the best scene structure yourself."
+            ),
+            content_type="spiritual_reflection",
+            tone="quiet reflective",
+            target_audience="general",
+            language="English",
+            duration_seconds=30,
+            visual_style="Quiet Cinematic Animation",
+            depth_level="deep",
+        )
+        result = run_creative_pipeline(request=request, ollama_chat=fake_ollama)
+        self.assertEqual(
+            [constraint.description for constraint in result.narrative_constraints],
+            [
+                "smoke covering fire",
+                "dust covering a mirror",
+                "unborn life enclosed within the womb",
+            ],
+        )
+        joined = " | ".join(constraint.description for constraint in result.narrative_constraints).lower()
+        self.assertNotIn("restrained movement", joined)
+        self.assertNotIn("same character", joined)
+
+    def test_plot_request_constraints_exclude_style_language(self) -> None:
+        fake_ollama = build_fake_ollama()
+        request = CreativeRequest(
+            idea=(
+                "Create a funny story using a husband hiding an online purchase, his wife finding the package, "
+                "and his attempt to pretend it was already in the house. Use warm lighting and restrained animation."
+            ),
+            content_type="humor",
+            tone="wry",
+            target_audience="general",
+            language="English",
+            duration_seconds=15,
+            visual_style="Quiet Cinematic Animation",
+        )
+        result = run_creative_pipeline(request=request, ollama_chat=fake_ollama)
+        self.assertEqual(
+            [constraint.description for constraint in result.narrative_constraints],
+            [
+                "husband hides an online purchase",
+                "wife finds the package",
+                "husband pretends it was already in the house",
+            ],
+        )
+
+    def test_educational_request_constraints_exclude_visual_style_language(self) -> None:
+        fake_ollama = build_fake_ollama()
+        request = CreativeRequest(
+            idea="Create an educational video using evaporation, condensation, and rainfall. Use simple illustrations and slow motion.",
+            content_type="education",
+            tone="clear",
+            target_audience="general",
+            language="English",
+            duration_seconds=15,
+            visual_style="Minimal Illustration",
+        )
+        result = run_creative_pipeline(request=request, ollama_chat=fake_ollama)
+        self.assertEqual(
+            [constraint.description for constraint in result.narrative_constraints],
+            ["evaporation", "condensation", "rainfall"],
+        )
 
     def test_critic_produces_structured_scores(self) -> None:
         fake_ollama = build_fake_ollama()

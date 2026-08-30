@@ -30,11 +30,12 @@ from video_agent import (
     VideoScene,
     build_creative_authority_payload,
     build_fallback_plan,
+    build_required_constraint_anchor,
     build_scene_durations,
     build_video_plan,
     build_video_plan_from_creative_result,
     build_video_settings,
-    extract_narrative_constraints,
+    infer_scene_continuity,
     narration_word_target,
     normalize_content_type,
     settings_changed,
@@ -182,6 +183,7 @@ class VideoAgentTests(unittest.TestCase):
         use_philosophy: bool = False,
         philosophy: PhilosophyInsight | None = None,
         psychology_contradiction: str = "A self-story and visible behavior do not match.",
+        narrative_constraints: list[NarrativeConstraint] | None = None,
     ) -> CreativeResult:
         return CreativeResult(
             request=CreativeRequest(
@@ -255,6 +257,7 @@ class VideoAgentTests(unittest.TestCase):
                 scene_beats=scene_beats,
             ),
             selected_specialists=["psychology", "ambiguity", "story", "critic"],
+            narrative_constraints=narrative_constraints or [],
         )
 
     def make_gita_creative_result(self) -> CreativeResult:
@@ -289,6 +292,11 @@ class VideoAgentTests(unittest.TestCase):
                 modern_reflection="Comparison and wanting can cloud ordinary attention today.",
             ),
             psychology_contradiction="The person wants clarity but keeps feeding desire.",
+            narrative_constraints=[
+                NarrativeConstraint("constraint_1", "source_metaphor", "smoke covering fire", "required", 1),
+                NarrativeConstraint("constraint_2", "source_metaphor", "dust covering a mirror", "required", 2),
+                NarrativeConstraint("constraint_3", "source_metaphor", "unborn life enclosed within the womb", "required", 3),
+            ],
         )
 
     def make_human_comedy_result(self) -> CreativeResult:
@@ -307,6 +315,13 @@ class VideoAgentTests(unittest.TestCase):
                 "The same person catches the contradiction in silence.",
             ],
             psychology_contradiction="The person says they do not care what people think but keeps checking who viewed the status.",
+            narrative_constraints=[
+                NarrativeConstraint(
+                    "constraint_1",
+                    "contradiction",
+                    "The person says they do not care what people think but keeps checking who viewed the status.",
+                )
+            ],
         )
 
     def make_storyboard(
@@ -415,8 +430,8 @@ class VideoAgentTests(unittest.TestCase):
         self.assertEqual(normalize_content_type("totally unknown"), "story")
         self.assertEqual(build_video_settings(content_type="???").content_type, "story")
 
-    def test_extract_narrative_constraints_generalizes_source_metaphors(self) -> None:
-        constraints = extract_narrative_constraints(self.make_gita_creative_result().request.idea)
+    def test_creative_result_constraints_drive_source_metaphors(self) -> None:
+        constraints = self.make_gita_creative_result().narrative_constraints
         self.assertEqual(
             [constraint.description for constraint in constraints[:3]],
             [
@@ -434,6 +449,34 @@ class VideoAgentTests(unittest.TestCase):
         self.assertIn("narrative_constraints", payload)
         self.assertNotIn("scene_assignments", payload.get("source_fidelity", {}))
         self.assertNotIn("third_metaphor_guidance", payload.get("source_fidelity", {}))
+
+    def test_symbolic_scene_continuity_hints_stay_independent(self) -> None:
+        hints = infer_scene_continuity(
+            [
+                "Smoke drifts across a low fire.",
+                "Dust settles over a mirror.",
+                "Unborn life remains enclosed within the womb.",
+            ]
+        )
+
+        self.assertEqual(
+            hints,
+            [("independent", None), ("independent", None), ("independent", None)],
+        )
+
+    def test_recurring_human_scene_continuity_hints_share_character_group(self) -> None:
+        hints = infer_scene_continuity(
+            [
+                "A person waits by the train window.",
+                "The same person folds the letter again.",
+                "The person finally steps onto the platform.",
+            ]
+        )
+
+        self.assertEqual(
+            hints,
+            [("character", "human_a"), ("character", "human_a"), ("character", "human_a")],
+        )
 
     def test_gita_style_reflection_passes_without_scene_number_anchor_locking(self) -> None:
         result = self.make_gita_creative_result()
@@ -469,6 +512,213 @@ class VideoAgentTests(unittest.TestCase):
         self.assertIsNone(warning)
         self.assertEqual(revision_mock.call_count, 1)
         self.assertIn("womb", plan.scenes[5].visual_prompt.lower())
+        self.assertTrue(
+            any(term in plan.scenes[5].visual_prompt.lower() for term in ("unborn", "fetal", "fetus", "child", "baby"))
+        )
+
+    def test_concrete_required_subject_survives_storyboard_generation(self) -> None:
+        result = self.make_creative_result(
+            idea="A wife discovers a package by the door and realizes it was meant for her.",
+            content_type="story",
+            premise="A delivery becomes a small emotional reveal.",
+            conflict="The unopened package carries quiet uncertainty.",
+            progression="The wife notices the package, approaches it, and opens it.",
+            emotional_turn="Recognition replaces suspicion.",
+            ending="She smiles when she sees her name on the note.",
+            scene_beats=[
+                "A package waits by the front door.",
+                "The wife discovers the package and kneels beside it.",
+                "The wife opens the package and reads the note.",
+            ],
+            narrative_constraints=[
+                NarrativeConstraint(
+                    "constraint_1",
+                    "required_event",
+                    "package discovered by wife",
+                )
+            ],
+        )
+        settings = build_video_settings(total_duration_seconds=15, content_type="story")
+        bad_plan = self.make_storyboard(
+            [
+                {
+                    "scene_number": 1,
+                    "narration": "A strange glow waits near the doorway.",
+                    "visual_prompt": "A mysterious box-shaped glow hovers near the front door.",
+                    "motion_prompt": "The glow pulses faintly in the quiet hall.",
+                    "scene_purpose": "introduce mystery",
+                    "continuity_mode": "independent",
+                    "continuity_group": None,
+                },
+                {
+                    "scene_number": 2,
+                    "narration": "She senses that the sign is meant for her.",
+                    "visual_prompt": "A woman pauses before the glowing shape without touching it.",
+                    "motion_prompt": "She leans in while the light trembles.",
+                    "scene_purpose": "build intrigue",
+                    "continuity_mode": "character",
+                    "continuity_group": "person_a",
+                },
+                {
+                    "scene_number": 3,
+                    "narration": "The hallway softens into understanding.",
+                    "visual_prompt": "Warm light fills the entryway as the meaning becomes clear.",
+                    "motion_prompt": "The camera drifts closer through the glow.",
+                    "scene_purpose": "resolve mystery",
+                    "continuity_mode": "independent",
+                    "continuity_group": None,
+                },
+            ],
+            title="Doorway Signal",
+            narration=None,
+        )
+        fixed_plan = self.make_storyboard(
+            [
+                {
+                    "scene_number": 1,
+                    "narration": "A package waits by the front door at the wife's feet.",
+                    "visual_prompt": "A taped package rests by the front door in a quiet apartment entryway.",
+                    "motion_prompt": "The camera eases toward the package from the hallway.",
+                    "scene_purpose": "introduce discovery setup",
+                    "continuity_mode": "independent",
+                    "continuity_group": None,
+                },
+                {
+                    "scene_number": 2,
+                    "narration": "The wife discovers the package and kneels beside it in surprise.",
+                    "visual_prompt": "The wife kneels by the front door and touches the discovered package with cautious curiosity.",
+                    "motion_prompt": "She slows, bends down, and reaches toward the package.",
+                    "scene_purpose": "show discovery",
+                    "continuity_mode": "character",
+                    "continuity_group": "person_a",
+                },
+                {
+                    "scene_number": 3,
+                    "narration": "She opens the package and sees that it was meant for her.",
+                    "visual_prompt": "The same wife opens the package on the floor and finds a handwritten note inside.",
+                    "motion_prompt": "The lid lifts and her expression softens.",
+                    "scene_purpose": "resolve reveal",
+                    "continuity_mode": "character",
+                    "continuity_group": "person_a",
+                },
+            ],
+            title="Doorway Delivery",
+            narration=None,
+        )
+
+        with patch("video_agent.request_video_plan_from_ollama", return_value=json.dumps(bad_plan)):
+            with patch("video_agent.request_storyboard_revision_from_ollama", return_value=json.dumps(fixed_plan)) as revision_mock:
+                plan, warning = build_video_plan_from_creative_result(result.request.idea, result, settings)
+
+        self.assertIsNone(warning)
+        self.assertEqual(revision_mock.call_count, 1)
+        storyboard_text = " ".join(scene.narration + " " + scene.visual_prompt for scene in plan.scenes).lower()
+        self.assertIn("package", storyboard_text)
+        self.assertIn("wife", storyboard_text)
+
+    def test_concrete_required_subject_ignores_abstract_metaphor_explanation_tail(self) -> None:
+        result = self.make_creative_result(
+            idea="A reflective sequence uses the womb image to show how desire can hide potential.",
+            content_type="spiritual_reflection",
+            premise="Potential remains present even when covered.",
+            conflict="Desire obscures what is still alive underneath.",
+            progression="The image appears first, then the reflection interprets it.",
+            emotional_turn="The viewer recognizes the covering without losing sight of what is covered.",
+            ending="The metaphor lands without replacing the subject itself.",
+            scene_beats=[
+                "Unborn life remains enclosed by the womb.",
+                "The image invites reflection on obscured potential.",
+                "Clarity returns without erasing the original metaphor.",
+            ],
+            narrative_constraints=[
+                NarrativeConstraint(
+                    "constraint_1",
+                    "required_object",
+                    "Unborn life enclosed by the womb as a metaphor for desire's containment of potential.",
+                )
+            ],
+        )
+        settings = build_video_settings(total_duration_seconds=15, content_type="spiritual_reflection")
+        raw_plan = self.make_storyboard(
+            [
+                {
+                    "scene_number": 1,
+                    "narration": "Unborn life rests within the womb in protected stillness.",
+                    "visual_prompt": "A respectful symbolic depiction of unborn life visibly enclosed within the womb in warm shadow.",
+                    "motion_prompt": "The frame holds with a slow protective drift.",
+                    "scene_purpose": "present source metaphor",
+                    "continuity_mode": "independent",
+                    "continuity_group": None,
+                },
+                {
+                    "scene_number": 2,
+                    "narration": "The image lingers before the interpretation begins.",
+                    "visual_prompt": "The same warm enclosure remains still as the metaphor settles.",
+                    "motion_prompt": "The camera breathes forward almost imperceptibly.",
+                    "scene_purpose": "hold reflection",
+                    "continuity_mode": "independent",
+                    "continuity_group": None,
+                },
+                {
+                    "scene_number": 3,
+                    "narration": "The meaning becomes clear without losing the original image.",
+                    "visual_prompt": "The protected unborn form remains identifiable as the scene fades toward clarity.",
+                    "motion_prompt": "A soft widening of the frame closes the sequence.",
+                    "scene_purpose": "resolve reflection",
+                    "continuity_mode": "independent",
+                    "continuity_group": None,
+                },
+            ],
+            narration=None,
+        )
+
+        with patch("video_agent.request_video_plan_from_ollama", return_value=json.dumps(raw_plan)):
+            with patch("video_agent.request_storyboard_revision_from_ollama") as revision_mock:
+                plan, warning = build_video_plan_from_creative_result(result.request.idea, result, settings)
+
+        self.assertIsNone(warning)
+        revision_mock.assert_not_called()
+        self.assertIn("womb", plan.scenes[0].visual_prompt.lower())
+        self.assertTrue(
+            any(term in plan.scenes[0].visual_prompt.lower() for term in ("unborn", "fetal", "fetus", "child", "baby"))
+        )
+
+    def test_required_constraint_anchor_splits_illustrates_and_hints_at_tails(self) -> None:
+        womb_anchor = build_required_constraint_anchor(
+            NarrativeConstraint(
+                "constraint_1",
+                "required_object",
+                "Unborn life enclosed by the womb illustrates desire concealing potential.",
+            )
+        )
+        water_anchor = build_required_constraint_anchor(
+            NarrativeConstraint(
+                "constraint_2",
+                "required_object",
+                "Viewer lingers on water's surface where shadow's dissolution hints at erasure and potential.",
+            )
+        )
+
+        assert womb_anchor is not None
+        assert water_anchor is not None
+        self.assertEqual(womb_anchor.canonical_text, "unborn life enclosed by the womb")
+        self.assertEqual(
+            water_anchor.canonical_text,
+            "viewer lingers on water's surface where shadow's dissolution",
+        )
+        self.assertEqual(womb_anchor.minimum_groups, 2)
+        self.assertEqual(water_anchor.minimum_groups, 2)
+
+    def test_required_constraint_anchor_skips_abstract_only_constraint(self) -> None:
+        anchor = build_required_constraint_anchor(
+            NarrativeConstraint(
+                "constraint_1",
+                "required_object",
+                "Desire functions as a mental fog filtering experience through craving.",
+            )
+        )
+
+        self.assertIsNone(anchor)
 
     def test_revision_failure_is_explicit_and_stops_after_one_try(self) -> None:
         result = self.make_gita_creative_result()
@@ -568,6 +818,13 @@ class VideoAgentTests(unittest.TestCase):
                 "The same couple goes quiet after a small misunderstanding.",
                 "The same couple reconnects over a laugh at the kitchen table.",
             ],
+            narrative_constraints=[
+                NarrativeConstraint(
+                    "constraint_1",
+                    "required_character",
+                    "A couple must appear as recurring human subjects where the story calls for them.",
+                )
+            ],
         )
         settings = build_video_settings(total_duration_seconds=15, content_type="story")
         raw_plan = self.make_storyboard(
@@ -628,6 +885,7 @@ class VideoAgentTests(unittest.TestCase):
             contradiction="",
             audience_rel_path="Relatable path.",
         )
+        result.narrative_constraints = []
         settings = build_video_settings(total_duration_seconds=15, content_type="human_behavior")
         raw_plan = self.make_storyboard(
             [
@@ -666,6 +924,49 @@ class VideoAgentTests(unittest.TestCase):
             plan, _ = build_video_plan_from_creative_result(result.request.idea, result, settings)
 
         self.assertEqual(plan.narration, "First line. Second line. Third line.")
+
+    def test_missing_scene_purpose_defaults_during_creative_storyboard_validation(self) -> None:
+        result = self.make_human_comedy_result()
+        settings = build_video_settings(total_duration_seconds=15, content_type="human_behavior")
+        raw_plan = self.make_storyboard(
+            [
+                {
+                    "scene_number": 1,
+                    "narration": "The person says they do not care what people think.",
+                    "visual_prompt": "A person shrugs in public and claims indifference.",
+                    "motion_prompt": "A small shrug and dismissive hand wave.",
+                    "continuity_mode": "character",
+                    "continuity_group": "person_a",
+                },
+                {
+                    "scene_number": 2,
+                    "narration": "Seconds later the same person checks who viewed the status again.",
+                    "visual_prompt": "The same person stares at the WhatsApp status viewer list on the phone.",
+                    "motion_prompt": "The thumb refreshes the list and pauses.",
+                    "continuity_mode": "character",
+                    "continuity_group": "person_a",
+                },
+                {
+                    "scene_number": 3,
+                    "narration": "The screen light catches the person's quiet embarrassment.",
+                    "visual_prompt": "The same person locks the phone and avoids their own reflection.",
+                    "motion_prompt": "The phone lowers and the eyes look away.",
+                    "continuity_mode": "character",
+                    "continuity_group": "person_a",
+                },
+            ],
+            narration=None,
+        )
+        for scene in raw_plan["scenes"]:
+            scene.pop("scene_purpose", None)
+
+        with patch("video_agent.request_video_plan_from_ollama", return_value=json.dumps(raw_plan)):
+            with patch("video_agent.request_storyboard_revision_from_ollama") as revision_mock:
+                plan, warning = build_video_plan_from_creative_result(result.request.idea, result, settings)
+
+        self.assertIsNone(warning)
+        revision_mock.assert_not_called()
+        self.assertEqual([scene.scene_purpose for scene in plan.scenes], ["open", "middle", "close"])
 
     def test_generic_placeholder_scene_triggers_one_revision(self) -> None:
         result = self.make_human_comedy_result()

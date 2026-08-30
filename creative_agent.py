@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import time
-from dataclasses import asdict, fields, is_dataclass
+from dataclasses import asdict, dataclass, fields, is_dataclass
 from typing import Any, Callable, TypedDict, get_args, get_origin, get_type_hints
 
 import ollama
@@ -33,6 +33,7 @@ from creative_models import (
     CreativeResult,
     DirectorDecision,
     HumorInsight,
+    NarrativeConstraint,
     PhilosophyInsight,
     PsychologyInsight,
     RoleExecution,
@@ -66,6 +67,7 @@ class CreativeState(TypedDict):
     story: StoryDraft | None
     critic: CreativeEvaluation | None
     final_story: StoryDraft | None
+    narrative_constraints: list[NarrativeConstraint]
     warnings: list[str]
     execution_log: list[RoleExecution]
     completed_roles: list[str]
@@ -84,48 +86,23 @@ SOURCE_TEXT_MARKERS = (
 REFLECTIVE_CONTENT_TYPES = {"philosophy", "spiritual_reflection"}
 
 
-def extract_explicit_source_metaphors(idea: str) -> list[str]:
-    cleaned = " ".join((idea or "").split()).strip()
-    if not cleaned:
-        return []
-
-    lowered = cleaned.lower()
-    captured = ""
-    using_match = re.search(r"\busing\s+(.+?)(?:\.\s+use\b|$)", cleaned, flags=re.IGNORECASE)
-    if using_match:
-        captured = using_match.group(1).strip(" .")
-    elif "smoke covering fire" in lowered and "dust covering a mirror" in lowered:
-        captured = cleaned
-
-    if not captured:
-        return []
-
-    normalized = captured.replace(", and ", ", ").replace(" and ", ", ")
-    parts = [part.strip(" .") for part in normalized.split(",") if part.strip(" .")]
-    metaphors: list[str] = []
-    for part in parts:
-        lowered_part = part.lower()
-        if "womb" in lowered_part and "unborn" in lowered_part:
-            metaphors.append("unborn life enclosed within the womb")
-        else:
-            metaphors.append(lowered_part)
-    return metaphors
+@dataclass
+class NarrativeConstraintSet:
+    narrative_constraints: list[NarrativeConstraint]
 
 
 def is_source_based_reflective_request(request: CreativeRequest) -> bool:
     idea_lower = (request.idea or "").lower()
     content_type = (request.content_type or "").lower()
     has_source_marker = any(marker in idea_lower for marker in SOURCE_TEXT_MARKERS)
-    has_explicit_metaphors = bool(extract_explicit_source_metaphors(request.idea))
     is_reflective_type = content_type in REFLECTIVE_CONTENT_TYPES or "reflect" in (request.tone or "").lower()
-    return (has_source_marker or has_explicit_metaphors) and is_reflective_type
+    return has_source_marker and is_reflective_type
 
 
 def build_source_fidelity_guidance(request: CreativeRequest) -> str:
     if not is_source_based_reflective_request(request):
         return ""
 
-    metaphors = extract_explicit_source_metaphors(request.idea)
     lines = [
         "This is a source-based reflective request.",
         "Prioritize source fidelity before poetic invention.",
@@ -133,14 +110,6 @@ def build_source_fidelity_guidance(request: CreativeRequest) -> str:
         "Present the source imagery first, then move into modern reflection.",
         "Keep the tone contemplative, but do not replace source meaning with generic spiritual symbolism.",
     ]
-    if metaphors:
-        lines.append("Explicit source metaphors to preserve in order:")
-        lines.extend(f"- {metaphor}" for metaphor in metaphors)
-        if any("womb" in metaphor and "unborn" in metaphor for metaphor in metaphors):
-            lines.append(
-                "- Present unborn life enclosed within the womb respectfully and symbolically, not medically, "
-                "and do not transform it into jars, seeds, cracks, or other substitute objects."
-            )
     return "\n".join(lines)
 
 
@@ -416,6 +385,28 @@ def build_revision_prompt(state: CreativeState) -> str:
     )
 
 
+def build_constraint_prompt(state: CreativeState) -> str:
+    return (
+        "Extract only the narrative requirements that must survive into the storyboard.\n"
+        "Return a JSON object with one field: narrative_constraints.\n"
+        "Each item must use this schema:\n"
+        '{ "id": "constraint_1", "constraint_type": "source_metaphor | plot_event | factual_anchor | contradiction | required_character | required_object | emotional_turn | educational_step | brand_requirement", "description": "clear narrative requirement", "importance": "required | optional", "source_order": 1 }\n'
+        "Include only story content requirements.\n"
+        "Do not include style, lighting, palette, camera language, pacing, motion style, continuity instructions, or general creative advice.\n"
+        "Do not turn aesthetic phrases like 'muted earthy colors', 'restrained movement', 'warm lighting', 'simple illustrations', or 'slow motion' into narrative constraints.\n"
+        "If the request is source-based, include the actual source metaphors or source concepts that must survive.\n"
+        "If the request contains a plot sequence or educational sequence, include the concrete events or concepts.\n"
+        "Prefer 0 to 6 high-signal constraints. Do not restate every sentence.\n\n"
+        f"Request:\n{dataclass_to_json(state['request'])}\n\n"
+        f"Director:\n{dataclass_to_json(state['director'])}\n\n"
+        f"Psychology:\n{dataclass_to_json(state['psychology'])}\n\n"
+        f"Philosophy:\n{dataclass_to_json(state['philosophy'])}\n\n"
+        f"Ambiguity:\n{dataclass_to_json(state['ambiguity'])}\n\n"
+        f"Humor:\n{dataclass_to_json(state['humor'])}\n\n"
+        f"Final story:\n{dataclass_to_json(state['final_story'])}"
+    )
+
+
 def make_state(
     request: CreativeRequest,
     model_config: CreativeModelConfig,
@@ -433,6 +424,7 @@ def make_state(
         "story": None,
         "critic": None,
         "final_story": None,
+        "narrative_constraints": [],
         "warnings": [],
         "execution_log": [],
         "completed_roles": [],
@@ -565,6 +557,34 @@ def revision_node_factory(
     return node
 
 
+def constraint_node_factory(
+    ollama_chat: Callable[..., dict[str, Any]],
+    progress_callback: Callable[[str], None] | None,
+) -> Callable[[CreativeState], CreativeState]:
+    def node(state: CreativeState) -> CreativeState:
+        if progress_callback:
+            progress_callback("Extracting narrative constraints")
+        model_name = state["model_config"].model_for_role(ROLE_STORY)
+        started_at = time.perf_counter()
+        constraint_set = call_local_model(
+            model_name=model_name,
+            system_prompt=build_constraint_prompt(state),
+            user_prompt="Return the narrative constraint JSON now.",
+            output_schema=NarrativeConstraintSet,
+            ollama_chat=ollama_chat,
+        )
+        duration_seconds = time.perf_counter() - started_at
+        logger.info("creative role=constraints model=%s duration_seconds=%.3f", model_name, duration_seconds)
+        state["narrative_constraints"] = constraint_set.narrative_constraints
+        state["execution_log"] = [
+            *state["execution_log"],
+            RoleExecution(role="constraints", model_name=model_name, duration_seconds=duration_seconds, status="ok"),
+        ]
+        return state
+
+    return node
+
+
 def should_run_psychology(state: CreativeState) -> str:
     return ROLE_PSYCHOLOGY if state["director"] and state["director"].use_psychology else next_after(ROLE_PSYCHOLOGY, state)
 
@@ -630,6 +650,7 @@ def create_creative_graph(
         specialist_node_factory(ROLE_CRITIC, CreativeEvaluation, build_critic_prompt, "critic", ollama_chat, progress_callback),
     )
     builder.add_node("revision", revision_node_factory(ollama_chat, progress_callback))
+    builder.add_node("constraints", constraint_node_factory(ollama_chat, progress_callback))
 
     builder.add_edge(START, ROLE_DIRECTOR)
     builder.add_conditional_edges(
@@ -673,7 +694,8 @@ def create_creative_graph(
     builder.add_edge(ROLE_HUMOR, ROLE_STORY)
     builder.add_edge(ROLE_STORY, ROLE_CRITIC)
     builder.add_edge(ROLE_CRITIC, "revision")
-    builder.add_edge("revision", END)
+    builder.add_edge("revision", "constraints")
+    builder.add_edge("constraints", END)
     return builder.compile()
 
 
@@ -684,6 +706,7 @@ def build_creative_summary(result: CreativeResult) -> dict[str, Any]:
         "philosophical_question": result.philosophy.central_question if result.philosophy else "",
         "humor_direction": result.humor.humor_style if result.humor else "",
         "ambiguity_note": result.ambiguity.unresolved_question if result.ambiguity else "",
+        "narrative_constraints": [constraint.description for constraint in result.narrative_constraints],
         "critic_scores": {
             "relatability": result.critic.relatability_score,
             "clarity": result.critic.clarity_score,
@@ -725,6 +748,7 @@ def run_creative_pipeline(
         critic=critic,
         final_story=final_story,
         selected_specialists=director.selected_specialists(),
+        narrative_constraints=final_state["narrative_constraints"],
         warnings=final_state["warnings"],
         execution_log=final_state["execution_log"],
         creative_summary={},

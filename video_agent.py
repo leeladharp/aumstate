@@ -8,7 +8,7 @@ from typing import Any
 
 import ollama
 
-from creative_models import CreativeResult
+from creative_models import CreativeResult, NarrativeConstraint
 from error_utils import format_user_error
 
 
@@ -118,6 +118,19 @@ HUMAN_BEAT_KEYWORDS = (
     "her ",
     "their ",
 )
+HUMAN_SUBJECT_LABELS = (
+    "couple",
+    "person",
+    "woman",
+    "man",
+    "child",
+    "mother",
+    "father",
+    "wife",
+    "husband",
+    "girl",
+    "boy",
+)
 WORLD_BEAT_KEYWORDS = (
     "room",
     "street",
@@ -128,15 +141,29 @@ WORLD_BEAT_KEYWORDS = (
     "temple",
     "classroom",
 )
-SOURCE_TEXT_MARKERS = (
-    "bhagavad gita",
-    "verse",
-    "scripture",
-    "sutra",
-    "upanishad",
-    "quran",
-    "bible",
-    "source text",
+RECURRENCE_CUES = (
+    "same ",
+    "again",
+    "returns",
+    "back ",
+    "still ",
+)
+CONCRETE_CONSTRAINT_SPLIT_PATTERNS = (
+    r"\bas a metaphor for\b",
+    r"\bas metaphor for\b",
+    r"\bas a symbol of\b",
+    r"\bas symbol of\b",
+    r"\billustrates\b",
+    r"\billustrating\b",
+    r"\bhints at\b",
+    r"\bhinting at\b",
+    r"\bfunctions as\b",
+    r"\bsymbolizing\b",
+    r"\bsymbolising\b",
+    r"\brepresenting\b",
+    r"\bto represent\b",
+    r"\bto symbolize\b",
+    r"\bto symbolise\b",
 )
 SOURCE_STOPWORDS = {
     "a",
@@ -214,18 +241,10 @@ class VideoPlan:
 
 
 @dataclass(frozen=True)
-class NarrativeConstraint:
-    id: str
-    constraint_type: str
-    description: str
-    importance: str = "required"
-    source_order: int | None = None
-
-
-@dataclass(frozen=True)
 class SourceAnchor:
     canonical_text: str
     concept_groups: tuple[tuple[str, ...], ...]
+    minimum_groups: int | None = None
 
 
 class StoryboardGenerationError(ValueError):
@@ -379,40 +398,12 @@ def is_generic_scene_text(text: str) -> bool:
     return any(fragment in lowered for fragment in GENERIC_SCENE_TEXT_FRAGMENTS)
 
 
-def extract_explicit_source_metaphors(idea: str) -> list[str]:
-    cleaned = " ".join((idea or "").split()).strip()
-    if not cleaned:
-        return []
-
-    lowered = cleaned.lower()
-    captured = ""
-    using_match = re.search(r"\busing\s+(.+?)(?:\.\s+use\b|$)", cleaned, flags=re.IGNORECASE)
-    if using_match:
-        captured = using_match.group(1).strip(" .")
-    elif "smoke covering fire" in lowered and "dust covering a mirror" in lowered:
-        captured = cleaned
-
-    if not captured:
-        return []
-
-    normalized = captured.replace(", and ", ", ").replace(" and ", ", ")
-    parts = [part.strip(" .") for part in normalized.split(",") if part.strip(" .")]
-    metaphors: list[str] = []
-    for part in parts:
-        lowered_part = part.lower()
-        if "womb" in lowered_part and "unborn" in lowered_part:
-            metaphors.append("unborn life enclosed within the womb")
-        else:
-            metaphors.append(lowered_part)
-    return metaphors
-
-
-def is_source_based_reflection(idea: str, content_type: str) -> bool:
-    lowered = (idea or "").lower()
-    normalized_content_type = normalize_content_type(content_type)
+def is_source_based_reflection(creative_result: CreativeResult) -> bool:
+    normalized_content_type = normalize_content_type(creative_result.request.content_type)
     return (
-        any(marker in lowered for marker in SOURCE_TEXT_MARKERS) or bool(extract_explicit_source_metaphors(idea))
-    ) and normalized_content_type in {"philosophy", "spiritual_reflection"}
+        normalized_content_type in {"philosophy", "spiritual_reflection"}
+        and any(constraint.constraint_type == "source_metaphor" for constraint in creative_result.narrative_constraints)
+    )
 
 
 def metaphor_keywords(metaphor: str) -> list[str]:
@@ -439,37 +430,130 @@ def build_source_anchor(metaphor: str) -> SourceAnchor:
             concept_groups=(("womb",), ("unborn", "child", "baby", "infant", "embryo", "fetus", "foetus")),
         )
     keywords = tuple((keyword,) for keyword in metaphor_keywords(metaphor))
-    return SourceAnchor(canonical_text=metaphor.lower(), concept_groups=keywords)
+    minimum_groups = max(2, len(keywords) - 1) if keywords else None
+    return SourceAnchor(canonical_text=metaphor.lower(), concept_groups=keywords, minimum_groups=minimum_groups)
 
 
 def text_matches_source_anchor(text: str, anchor: SourceAnchor) -> bool:
     lowered = " ".join((text or "").lower().replace("-", " ").split())
     if not lowered:
         return False
-    return all(any(term in lowered for term in group) for group in anchor.concept_groups)
+    matched_groups = sum(
+        1
+        for group in anchor.concept_groups
+        if any(keyword_signal_present(lowered, term) for term in group)
+    )
+    required_groups = anchor.minimum_groups if anchor.minimum_groups is not None else len(anchor.concept_groups)
+    return matched_groups >= required_groups
+
+
+def extract_human_subject_label(beat: str) -> str | None:
+    lowered = f" {(beat or '').lower().replace('-', ' ')} "
+    for label in HUMAN_SUBJECT_LABELS:
+        if re.search(rf"\b{label}'s\b", lowered):
+            return label
+        if re.search(rf"\b(?:a|an|the|same|this|that|modern|young|old|elderly)\s+{label}\b", lowered):
+            return label
+        if re.search(rf"\b{label}\b", lowered):
+            return label
+    return None
+
+
+def extract_world_subject_label(beat: str) -> str | None:
+    lowered = f" {(beat or '').lower().replace('-', ' ')} "
+    for label in WORLD_BEAT_KEYWORDS:
+        if re.search(rf"\b(?:same|the|this|that)\s+{label}\b", lowered):
+            return label
+    return None
+
+
+def mentions_recurrence(beat: str) -> bool:
+    lowered = f" {(beat or '').lower()} "
+    return any(cue in lowered for cue in RECURRENCE_CUES)
+
+
+def extract_concrete_constraint_text(description: str) -> str:
+    cleaned = " ".join((description or "").split()).strip()
+    if not cleaned:
+        return ""
+    lowered = cleaned.lower()
+    for pattern in CONCRETE_CONSTRAINT_SPLIT_PATTERNS:
+        parts = re.split(pattern, lowered, maxsplit=1)
+        if len(parts) == 2:
+            return parts[0].strip(" ,.:;")
+    return lowered
+
+
+def is_concrete_constraint_text(text: str) -> bool:
+    lowered = " ".join((text or "").lower().split())
+    if not lowered:
+        return False
+    if build_source_anchor(lowered).concept_groups and build_source_anchor(lowered).canonical_text != lowered:
+        return True
+    if extract_human_subject_label(lowered) is not None:
+        return True
+    if extract_world_subject_label(lowered) is not None:
+        return True
+    if re.search(r"\b(a|an|the|same|this|that)\s+[a-z][a-z']+\b", lowered):
+        return True
+    if re.search(r"\b[a-z][a-z']*'s\s+[a-z][a-z']+\b", lowered):
+        return True
+    return False
 
 
 def infer_scene_continuity(scene_beats: list[str]) -> list[tuple[str, str | None]]:
     hints: list[tuple[str, str | None]] = []
-    shared_character_group: str | None = None
-    shared_world_group: str | None = None
+    human_labels = [extract_human_subject_label(beat) for beat in scene_beats]
+    world_labels = [extract_world_subject_label(beat) for beat in scene_beats]
+    human_counts: dict[str, int] = {}
+    world_counts: dict[str, int] = {}
 
-    for beat in scene_beats:
+    for label in human_labels:
+        if label is not None:
+            human_counts[label] = human_counts.get(label, 0) + 1
+    for label in world_labels:
+        if label is not None:
+            world_counts[label] = world_counts.get(label, 0) + 1
+
+    for beat, human_label, world_label in zip(scene_beats, human_labels, world_labels):
         lowered = f" {(beat or '').lower()} "
         mentions_human = any(keyword in lowered for keyword in HUMAN_BEAT_KEYWORDS)
         mentions_world = any(keyword in lowered for keyword in WORLD_BEAT_KEYWORDS)
+        recurring_human = human_label is not None and human_counts.get(human_label, 0) > 1
+        recurring_world = world_label is not None and (
+            world_counts.get(world_label, 0) > 1 or mentions_recurrence(beat)
+        )
 
-        if mentions_human:
-            shared_character_group = shared_character_group or "human_a"
-            hints.append(("character", shared_character_group))
+        if mentions_human and recurring_human:
+            hints.append(("character", "human_a"))
             continue
-        if mentions_world:
-            shared_world_group = shared_world_group or "world_a"
-            hints.append(("world", shared_world_group))
+        if mentions_world and recurring_world:
+            hints.append(("world", "world_a"))
             continue
         hints.append(("independent", None))
 
     return hints
+
+
+def build_required_constraint_anchor(constraint: NarrativeConstraint) -> SourceAnchor | None:
+    if constraint.importance != "required":
+        return None
+    if constraint.constraint_type in {"contradiction", "required_character"}:
+        return None
+    if constraint.constraint_type == "source_metaphor":
+        return build_source_anchor(constraint.description)
+
+    concrete_text = extract_concrete_constraint_text(constraint.description)
+    if not is_concrete_constraint_text(concrete_text):
+        return None
+    keywords = tuple((keyword,) for keyword in metaphor_keywords(concrete_text))
+    if not keywords:
+        return None
+    return SourceAnchor(
+        canonical_text=concrete_text,
+        concept_groups=keywords,
+        minimum_groups=min(2, len(keywords)),
+    )
 
 
 def build_default_style_lock(settings: VideoSettings) -> str:
@@ -578,54 +662,12 @@ def has_authorized_symbol(symbol: str, idea: str, creative_result: CreativeResul
     return any(symbol in haystack for haystack in haystacks)
 
 
-def extract_narrative_constraints(
-    idea: str,
-    creative_result: CreativeResult | None = None,
-) -> list[NarrativeConstraint]:
-    constraints: list[NarrativeConstraint] = []
-
-    for index, metaphor in enumerate(extract_explicit_source_metaphors(idea), start=1):
-        constraints.append(
-            NarrativeConstraint(
-                id=f"constraint_{index}",
-                constraint_type="source_metaphor",
-                description=build_source_anchor(metaphor).canonical_text,
-                importance="required",
-                source_order=index,
-            )
-        )
-
-    if creative_result is not None:
-        if creative_result.psychology and creative_result.psychology.contradiction.strip():
-            constraints.append(
-                NarrativeConstraint(
-                    id=f"constraint_{len(constraints) + 1}",
-                    constraint_type="contradiction",
-                    description=creative_result.psychology.contradiction.strip(),
-                    importance="required",
-                )
-            )
-
-        specialist_people = " ".join(creative_result.final_story.scene_beats).lower()
-        if "couple" in specialist_people:
-            constraints.append(
-                NarrativeConstraint(
-                    id=f"constraint_{len(constraints) + 1}",
-                    constraint_type="required_character",
-                    description="A couple must appear as recurring human subjects where the story calls for them.",
-                    importance="required",
-                )
-            )
-
-    return constraints
-
-
 def build_creative_authority_payload(
     result: CreativeResult,
     settings: VideoSettings,
     narrative_constraints: list[NarrativeConstraint] | None = None,
 ) -> dict[str, Any]:
-    narrative_constraints = narrative_constraints or extract_narrative_constraints(result.request.idea, result)
+    narrative_constraints = narrative_constraints or result.narrative_constraints
     continuity_hints = infer_scene_continuity(result.final_story.scene_beats)
 
     specialist_conclusions: dict[str, Any] = {}
@@ -705,8 +747,12 @@ def build_creative_authority_payload(
         ],
         "continuity_hints": scene_hints,
         "source_fidelity": {
-            "is_source_based_reflection": is_source_based_reflection(result.request.idea, result.request.content_type),
-            "explicit_source_metaphors": extract_explicit_source_metaphors(result.request.idea),
+            "is_source_based_reflection": is_source_based_reflection(result),
+            "explicit_source_metaphors": [
+                constraint.description
+                for constraint in narrative_constraints
+                if constraint.constraint_type == "source_metaphor"
+            ],
             "preserve_source_meaning_before_modern_interpretation": True,
             "do_not_fake_quotes": True,
             "do_not_replace_concrete_source_imagery_with_generic_spiritual_symbolism": True,
@@ -742,6 +788,14 @@ def build_storyboard_schema(settings: VideoSettings) -> str:
         "  ]\n"
         "}"
     )
+
+
+def default_scene_purpose(scene_number: int, scene_count: int) -> str:
+    if scene_number <= 1:
+        return "open"
+    if scene_number >= scene_count:
+        return "close"
+    return "middle"
 
 
 def build_planning_prompt(
@@ -782,11 +836,15 @@ Rules:
 - continuity_mode must be one of: independent, character, world, previous_scene.
 - continuity_group must be null for independent scenes and a short stable string otherwise.
 - Let the storyboard choose continuity where it genuinely helps. Do not force continuity into symbolic scenes.
+- Use continuity_mode="character" only when the scene itself shows a recurring visible human or character subject.
+- Symbolic, object-only, landscape, and environment-only scenes should normally use continuity_mode="independent" and continuity_group=null.
+- If a scene already has a valid continuity choice that matches its visible subject, preserve that choice.
 - Do not return content_type, duration_seconds, aspect_ratio, frame_rate, output size, settings, source_anchor_id, or story_anchor_id.
 - Do not invent recurring symbolic motifs unless the user requested them or the authoritative story clearly chose them.
 - Do not introduce glowing orb, magical light, floating symbol, or spiritual particle effect unless explicitly justified by the request or specialist insight.
 - For source-based reflective content, present the source imagery faithfully before modern interpretation.
 - Preserve source meaning and explicit metaphors without fake quotations or generic spiritual substitution.
+- When a required constraint names a concrete subject, object, event, or relationship, keep it visibly identifiable. Stylization is allowed, unrelated symbolic replacement is not.
 - narration must sound like narration, not production instructions.
 - visual_prompt must describe what the viewer sees.
 - motion_prompt must describe actual physical motion or camera motion.
@@ -828,6 +886,8 @@ def request_storyboard_revision_from_ollama(
         f"{build_storyboard_schema(settings)}\n"
         "Preserve everything that already works. Correct only the identified problems.\n"
         "Do not return application state fields.\n"
+        "Keep any existing continuity choice that is already valid for the visible subject in that scene.\n"
+        "Do not replace a required concrete subject, object, event, or relationship with an unrelated symbol.\n"
         f"Shared style_lock:\n{style_lock}\n"
         f"Validation issues:\n{json.dumps(validation_issues, indent=2, ensure_ascii=True)}\n"
         f"Original parsed storyboard:\n{json.dumps(original_storyboard, indent=2, ensure_ascii=True) if original_storyboard is not None else 'null'}\n"
@@ -869,7 +929,7 @@ def collect_structural_issues(plan_data: dict[str, Any] | None, settings: VideoS
         narration = str(scene_data.get("narration", "")).strip()
         visual_prompt = str(scene_data.get("visual_prompt", "")).strip()
         motion_prompt = str(scene_data.get("motion_prompt", "")).strip()
-        scene_purpose = str(scene_data.get("scene_purpose", "")).strip()
+        scene_purpose = str(scene_data.get("scene_purpose", "")).strip() or default_scene_purpose(index, settings.scene_count)
         continuity_mode = str(scene_data.get("continuity_mode", "independent")).strip() or "independent"
         continuity_group_raw = scene_data.get("continuity_group")
         continuity_group = str(continuity_group_raw).strip() if continuity_group_raw is not None else None
@@ -880,8 +940,6 @@ def collect_structural_issues(plan_data: dict[str, Any] | None, settings: VideoS
             issues.append(f"Scene {index} visual_prompt is required.")
         if not motion_prompt:
             issues.append(f"Scene {index} motion_prompt is required.")
-        if not scene_purpose:
-            issues.append(f"Scene {index} scene_purpose is required.")
         if continuity_mode not in VALID_CONTINUITY_MODES:
             issues.append(f"Scene {index} continuity_mode is invalid: {continuity_mode}.")
         elif continuity_mode != "independent" and not continuity_group:
@@ -902,6 +960,7 @@ def materialize_storyboard_scenes(plan_data: dict[str, Any], settings: VideoSett
         continuity_mode = str(scene_data.get("continuity_mode", "independent")).strip() or "independent"
         continuity_group_raw = scene_data.get("continuity_group")
         continuity_group = str(continuity_group_raw).strip() if continuity_group_raw is not None else None
+        scene_purpose = str(scene_data.get("scene_purpose", "")).strip() or default_scene_purpose(index, settings.scene_count)
         if continuity_mode == "independent":
             continuity_group = None
         scenes.append(
@@ -913,7 +972,7 @@ def materialize_storyboard_scenes(plan_data: dict[str, Any], settings: VideoSett
                 motion_prompt=str(scene_data["motion_prompt"]).strip(),
                 continuity_mode=continuity_mode,
                 continuity_group=continuity_group,
-                scene_purpose=str(scene_data["scene_purpose"]).strip(),
+                scene_purpose=scene_purpose,
             )
         )
     return scenes
@@ -1188,14 +1247,6 @@ def collect_constraint_issues(
         if constraint.importance != "required":
             continue
 
-        if constraint.constraint_type == "source_metaphor":
-            anchor = build_source_anchor(constraint.description)
-            if not text_matches_source_anchor(storyboard_text, anchor):
-                issues.append(
-                    f"Missing required source metaphor: {constraint.description}. Preserve the concrete source relationship somewhere in the storyboard."
-                )
-            continue
-
         if constraint.constraint_type == "contradiction":
             halves = contradiction_halves(constraint.description)
             if halves is None:
@@ -1212,6 +1263,13 @@ def collect_constraint_issues(
         if constraint.constraint_type == "required_character":
             if "couple" in constraint.description.lower() and "couple" not in storyboard_text:
                 issues.append("Missing required recurring couple in the storyboard.")
+            continue
+
+        anchor = build_required_constraint_anchor(constraint)
+        if anchor is not None and not text_matches_source_anchor(storyboard_text, anchor):
+            issues.append(
+                f"Missing required concrete subject or relationship: {constraint.description}. Keep the named subject or event identifiable instead of replacing it with a symbol."
+            )
 
     for scene in scenes:
         lowered_visual = scene.visual_prompt.lower()
@@ -1310,7 +1368,7 @@ def build_video_plan_from_creative_result(
     creative_result: CreativeResult,
     settings: VideoSettings,
 ) -> tuple[VideoPlan, str | None]:
-    narrative_constraints = extract_narrative_constraints(creative_result.request.idea, creative_result)
+    narrative_constraints = creative_result.narrative_constraints
     creative_authority = build_creative_authority_payload(
         creative_result,
         settings,
